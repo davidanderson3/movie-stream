@@ -14,7 +14,7 @@
     "generate:geoscore": "node scripts/generateGeoscoreQuestions.js",
     "update:cities": "node scripts/populateCities.js",
     "prepare": "husky install",
-    "start": "PORT=3003 node backend/server.js"
+    "start": "YOUTUBE_API_KEY=${YOUTUBE_API_KEY:-$(gcloud secrets versions access latest --secret=YOUTUBE_API_KEY 2>/dev/null | tr -d '\\n')} PORT=3005 node backend/server.js"
   },
   "keywords": [],
   "author": "",

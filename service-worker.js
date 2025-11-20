@@ -1,5 +1,5 @@
-const STATIC_CACHE = 'dashboard-static-v4';
-const DYNAMIC_CACHE = 'dashboard-dynamic-v1';
+const STATIC_CACHE = 'dashboard-static-v6';
+const DYNAMIC_CACHE = 'dashboard-dynamic-v2';
 const MAX_DYNAMIC_ENTRIES = 60;
 
 const PRECACHE_URLS = [
@@ -9,8 +9,6 @@ const PRECACHE_URLS = [
   './js/main.js',
   './js/tabs.js',
   './js/movies.js',
-  './js/shows.js',
-  './js/restaurants.js',
   './js/tabReports.js',
   './js/helpers.js',
   './js/auth.js',
@@ -40,19 +38,10 @@ async function putInCache(cacheName, request, response, maxEntries) {
   await trimCache(cacheName, maxEntries);
 }
 
-async function cacheFirst(request) {
-  const cached = await caches.match(request);
-  if (cached) return cached;
-  const response = await fetch(request);
-  if (response && response.ok) {
-    await putInCache(STATIC_CACHE, request, response.clone());
-  }
-  return response;
-}
-
-async function networkFirst(request, cacheName, { isDocument = false } = {}) {
+async function networkFirst(request, cacheName, { isDocument = false, cacheBust = false } = {}) {
+  const networkRequest = cacheBust ? new Request(request, { cache: 'reload' }) : request;
   try {
-    const response = await fetch(request);
+    const response = await fetch(networkRequest);
     if (response && response.ok) {
       const clone = response.clone();
       const maxEntries = cacheName === DYNAMIC_CACHE ? MAX_DYNAMIC_ENTRIES : undefined;
@@ -75,7 +64,12 @@ async function networkFirst(request, cacheName, { isDocument = false } = {}) {
 
 self.addEventListener('install', event => {
   event.waitUntil(
-    caches.open(STATIC_CACHE).then(cache => cache.addAll(PRECACHE_URLS))
+    (async () => {
+      const cache = await caches.open(STATIC_CACHE);
+      await Promise.all(
+        PRECACHE_URLS.map(url => cache.add(new Request(url, { cache: 'reload' })))
+      );
+    })()
   );
   self.skipWaiting();
 });
@@ -109,11 +103,16 @@ self.addEventListener('fetch', event => {
   const isNavigation = request.mode === 'navigate' || request.destination === 'document';
 
   if (PRECACHE_URL_SET.has(requestUrl.href)) {
-    event.respondWith(cacheFirst(request));
+    event.respondWith(
+      networkFirst(request, STATIC_CACHE, { cacheBust: true })
+    );
     return;
   }
 
   event.respondWith(
-    networkFirst(request, isNavigation ? STATIC_CACHE : DYNAMIC_CACHE, { isDocument: isNavigation })
+    networkFirst(request, isNavigation ? STATIC_CACHE : DYNAMIC_CACHE, {
+      isDocument: isNavigation,
+      cacheBust: isNavigation
+    })
   );
 });

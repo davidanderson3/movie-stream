@@ -31,45 +31,33 @@ service cloud.firestore {
       allow read, write: if request.auth != null && request.auth.uid == userId;
     }
 
-    // 4) Projects ordering at /decisions/{uid}
+    // 4) Goals ordering at /decisions/{uid}
     match /decisions/{userId} {
-      allow read: if request.auth != null && request.auth.uid == userId;
-      allow write: if request.auth != null
-                   && request.auth.uid == userId
-                   && request.resource.data.items is list
-                   && request.resource.data.items.size() > 0
-                   && request.resource.data.items.all(item,
-                        item.keys().hasAll(['id', 'text']) &&
-                        item.id is string && item.id.size() > 0 &&
-                        item.text is string && item.text.size() > 0 &&
-                        !item.id.matches('^demo-.*')
-                     )
-                   && itemsSignature(request.resource.data.items) !=
-                      SAMPLE_DECISIONS_SIGNATURE();
-    }
-
-    // 5) Restaurants storage at /restaurants/{uid}
-    match /restaurants/{userId} {
       allow read, write: if request.auth != null && request.auth.uid == userId;
     }
 
-    // 6) Lists storage at /lists/{uid}
+    // 5) Lists storage at /lists/{uid}
     match /lists/{userId} {
       allow read, write: if request.auth != null && request.auth.uid == userId;
     }
 
-    // 7) Daily notes at /dailyNotes/{uid}/notes/{noteId}
+    // 6) Daily notes at /dailyNotes/{uid}/notes/{noteId}
     match /dailyNotes/{userId}/notes/{noteId} {
       allow read, write: if request.auth != null && request.auth.uid == userId;
     }
 
-    // 8) Travel data at /users/{uid}/travel/{placeId}
+    // 7) Travel data at /users/{uid}/travel/{placeId}
     match /users/{userId}/travel/{placeId} {
       allow read, write: if request.auth != null && request.auth.uid == userId;
     }
 
-    // 9) Asset history at /users/{uid}/assetHistory/{dayId}
+    // 8) Asset history at /users/{uid}/assetHistory/{dayId}
     match /users/{userId}/assetHistory/{dayId} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+    }
+
+    // 9) Restore backups at /restoreBackups/{uid}
+    match /restoreBackups/{userId} {
       allow read, write: if request.auth != null && request.auth.uid == userId;
     }
 
@@ -78,8 +66,18 @@ service cloud.firestore {
       allow read, write: if true;
     }
 
-    // 11) TV show preferences stored at /tvPreferences/{uid}
+    // 11) movies
+    match /moviePreferences/{userId} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+    }
+
+    // 12) show preferences stored at /tvPreferences/{uid}
     match /tvPreferences/{userId} {
+      allow read, write: if request.auth != null && request.auth.uid == userId;
+    }
+
+    // 13) Restaurants storage at /restaurants/{uid}
+    match /restaurants/{userId} {
       allow read, write: if request.auth != null && request.auth.uid == userId;
     }
 

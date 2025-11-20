@@ -378,12 +378,7 @@ window.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  const SIGNED_OUT_TABS = [
-    'moviesPanel',
-    'tvPanel',
-    'showsPanel',
-    'restaurantsPanel'
-  ];
+  const SIGNED_OUT_TABS = ['moviesPanel'];
 
   function showOnlySignedOutTabs() {
     const allowed = new Set(SIGNED_OUT_TABS);

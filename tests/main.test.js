@@ -248,21 +248,15 @@ describe('shift+A hotkey', () => {
 });
 
   describe('signed-out tabs', () => {
-  it('keeps media tabs visible when not signed in', async () => {
+  it('keeps the movies tab visible when not signed in', async () => {
     const dom = new JSDOM(`
       <button id="signupBtn"></button>
       <button id="loginBtn"></button>
       <div id="goalsView"></div>
       <div id="tabsContainer">
         <button class="tab-button" data-target="moviesPanel"></button>
-        <button class="tab-button" data-target="tvPanel"></button>
-        <button class="tab-button" data-target="showsPanel"></button>
-        <button class="tab-button" data-target="restaurantsPanel"></button>
       </div>
       <div id="moviesPanel"></div>
-      <div id="tvPanel"></div>
-      <div id="showsPanel"></div>
-      <div id="restaurantsPanel"></div>
     `);
     global.window = dom.window;
     global.document = dom.window.document;
@@ -280,14 +274,7 @@ describe('shift+A hotkey', () => {
     await new Promise(r => setTimeout(r, 0));
 
     const moviesBtn = dom.window.document.querySelector('.tab-button[data-target="moviesPanel"]');
-    const tvBtn = dom.window.document.querySelector('.tab-button[data-target="tvPanel"]');
-    const showsBtn = dom.window.document.querySelector('.tab-button[data-target="showsPanel"]');
-    const restaurantsBtn = dom.window.document.querySelector('.tab-button[data-target="restaurantsPanel"]');
-
     expect(moviesBtn.style.display).not.toBe('none');
-    expect(tvBtn.style.display).not.toBe('none');
-    expect(showsBtn.style.display).not.toBe('none');
-    expect(restaurantsBtn.style.display).not.toBe('none');
     });
   });
 

@@ -3,7 +3,7 @@
 
 <head>
   <meta charset="UTF-8" />
-    <title>Dashboard</title>
+    <title>Movie Stream</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <link rel="stylesheet" href="style.css" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -14,10 +14,6 @@
   />
   <link rel="icon" href="assets/favicon.ico" type="image/x-icon">
   <link rel="icon" type="image/png" sizes="32x32" href="assets/favicon.png">
-  <link
-    rel="stylesheet"
-    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-  />
 </head>
 
 <body>
@@ -26,16 +22,9 @@
     <!-- NAVBAR -->
     <nav class="navbar">
       <div class="container navbar-inner">
-        <div class="navbar-left site-name">Dashboard</div>
         <div class="navbar-right">
           <button type="button" id="loginBtn" style="display:none;">Sign In</button>
         </div>
-      </div>
-      <div class="tabs scroll-tabs" id="tabsContainer" style="visibility:hidden;">
-        <button class="tab-button active" data-target="moviesPanel">Movies</button>
-        <button class="tab-button" data-target="tvPanel">TV Shows</button>
-        <button class="tab-button" data-target="showsPanel">Live Music</button>
-        <button class="tab-button" data-target="restaurantsPanel">Restaurants</button>
       </div>
     </nav>
 
@@ -45,73 +34,74 @@
     <!-- MOVIES PANEL -->
       <div id="moviesPanel" class="main-layout" style="display:none">
         <div class="full-column">
-          <div class="panel-header">
-            <h2>Movies</h2>
-            <button type="button" class="icon-btn tab-hide-btn" title="Hide Tab">🕒</button>
-          </div>
+        <header class="movies-panel-header">
+          <h1>Movie Stream</h1>
           <div id="movieTabs" class="movie-tabs">
             <button class="movie-tab active" data-target="movieStreamSection">Movie Stream</button>
             <button class="movie-tab" data-target="savedMoviesSection">Saved Movies</button>
             <button class="movie-tab" data-target="watchedMoviesSection">Watched Movies</button>
           </div>
+        </header>
         <div id="movieStreamSection">
           <div class="media-stream">
             <aside class="media-stream__filters">
-              <div id="movieFeedControls" class="movie-controls movie-filter-controls media-filter-toolbar">
-                <div class="movie-filter-field movie-filter-genre media-filter-toolbar__item">
-                  <span class="movie-filter-label">Genre</span>
-                  <div id="movieFilterGenre" class="genre-filter"></div>
+              <div class="movie-feed-status-row">
+                <div id="movieFeedControls" class="movie-controls movie-filter-controls media-filter-toolbar">
+                  <div class="movie-filter-field movie-filter-genre media-filter-toolbar__item">
+                    <span class="movie-filter-label">Genre</span>
+                    <div id="movieFilterGenre" class="genre-filter"></div>
+                  </div>
+                  <div class="movie-filter-field media-filter-toolbar__item">
+                    <label for="movieFilterMinRating">Min Rating</label>
+                    <input
+                      type="number"
+                      id="movieFilterMinRating"
+                      name="movieFilterMinRating"
+                      min="0"
+                      max="10"
+                      step="0.1"
+                      inputmode="decimal"
+                      placeholder="8"
+                    />
+                  </div>
+                  <div class="movie-filter-field media-filter-toolbar__item">
+                    <label for="movieFilterMinVotes">Min Votes</label>
+                    <input
+                      type="number"
+                      id="movieFilterMinVotes"
+                      name="movieFilterMinVotes"
+                      min="0"
+                      step="1"
+                      inputmode="numeric"
+                      placeholder="e.g. 100"
+                    />
+                  </div>
+                  <div class="movie-filter-field media-filter-toolbar__item">
+                    <label for="movieFilterStartYear">Earliest Year</label>
+                    <input
+                      type="number"
+                      id="movieFilterStartYear"
+                      name="movieFilterStartYear"
+                      inputmode="numeric"
+                      placeholder="e.g. 2010"
+                    />
+                  </div>
+                  <div class="movie-filter-field media-filter-toolbar__item">
+                    <label for="movieFilterEndYear">Latest Year</label>
+                    <input
+                      type="number"
+                      id="movieFilterEndYear"
+                      name="movieFilterEndYear"
+                      inputmode="numeric"
+                      placeholder="e.g. 2024"
+                    />
+                  </div>
                 </div>
-                <div class="movie-filter-field media-filter-toolbar__item">
-                  <label for="movieFilterMinRating">Min Rating</label>
-                  <input
-                    type="number"
-                    id="movieFilterMinRating"
-                    name="movieFilterMinRating"
-                    min="0"
-                    max="10"
-                    step="0.1"
-                    inputmode="decimal"
-                    placeholder="8"
-                  />
-                </div>
-                <div class="movie-filter-field media-filter-toolbar__item">
-                  <label for="movieFilterMinVotes">Min Votes</label>
-                  <input
-                    type="number"
-                    id="movieFilterMinVotes"
-                    name="movieFilterMinVotes"
-                    min="0"
-                    step="1"
-                    inputmode="numeric"
-                    placeholder="e.g. 100"
-                  />
-                </div>
-                <div class="movie-filter-field media-filter-toolbar__item">
-                  <label for="movieFilterStartYear">Earliest Year</label>
-                  <input
-                    type="number"
-                    id="movieFilterStartYear"
-                    name="movieFilterStartYear"
-                    inputmode="numeric"
-                    placeholder="e.g. 2010"
-                  />
-                </div>
-                <div class="movie-filter-field media-filter-toolbar__item">
-                  <label for="movieFilterEndYear">Latest Year</label>
-                  <input
-                    type="number"
-                    id="movieFilterEndYear"
-                    name="movieFilterEndYear"
-                    inputmode="numeric"
-                    placeholder="e.g. 2024"
-                  />
-                </div>
+                <div id="movieStatus" class="movie-status" aria-live="polite"></div>
               </div>
               <div id="movieStats" class="media-stats" aria-live="polite"></div>
             </aside>
             <section class="media-stream__content">
-              <div id="movieStatus" class="movie-status" aria-live="polite"></div>
               <div id="movieList" class="decision-container"></div>
             </section>
           </div>
@@ -136,193 +126,6 @@
           </footer>
         </div>
       </div>
-
-    <!-- TV SHOWS PANEL -->
-      <div id="tvPanel" class="main-layout" style="display:none">
-        <div class="full-column">
-          <div class="panel-header">
-            <h2>TV Shows</h2>
-            <button type="button" class="icon-btn tab-hide-btn" title="Hide Tab">🕒</button>
-          </div>
-          <div id="tvTabs" class="movie-tabs">
-            <button class="movie-tab active" data-target="tvStreamSection">Show Stream</button>
-            <button class="movie-tab" data-target="savedTvSection">Saved Shows</button>
-            <button class="movie-tab" data-target="watchedTvSection">Watched Shows</button>
-          </div>
-        <div id="tvStreamSection">
-          <div class="media-stream">
-            <aside class="media-stream__filters">
-              <div id="tvFeedControls" class="movie-controls movie-filter-controls">
-                <div class="movie-filter-field">
-                  <label for="tvFilterMinRating">Min Rating</label>
-                  <input
-                    type="number"
-                    id="tvFilterMinRating"
-                    name="tvFilterMinRating"
-                    min="0"
-                    max="10"
-                    step="0.1"
-                    inputmode="decimal"
-                    placeholder="e.g. 7"
-                  />
-                </div>
-                <div class="movie-filter-field">
-                  <label for="tvFilterMinVotes">Min Votes</label>
-                  <input
-                    type="number"
-                    id="tvFilterMinVotes"
-                    name="tvFilterMinVotes"
-                    min="0"
-                    step="1"
-                    inputmode="numeric"
-                    placeholder="e.g. 100"
-                  />
-                </div>
-                <div class="movie-filter-field">
-                  <label for="tvFilterStartYear">Earliest Year</label>
-                  <input
-                    type="number"
-                    id="tvFilterStartYear"
-                    name="tvFilterStartYear"
-                    inputmode="numeric"
-                    placeholder="e.g. 2010"
-                  />
-                </div>
-                <div class="movie-filter-field">
-                  <label for="tvFilterEndYear">Latest Year</label>
-                  <input
-                    type="number"
-                    id="tvFilterEndYear"
-                    name="tvFilterEndYear"
-                    inputmode="numeric"
-                    placeholder="e.g. 2024"
-                  />
-                </div>
-                <div class="movie-filter-field movie-filter-genre">
-                  <span class="movie-filter-label">Genre</span>
-                  <div id="tvFilterGenre" class="genre-filter"></div>
-                </div>
-              </div>
-              <div id="tvStats" class="media-stats" aria-live="polite"></div>
-            </aside>
-            <section class="media-stream__content">
-              <div id="tvStatus" class="movie-status tv-status" aria-live="polite"></div>
-              <div id="tvList" class="decision-container"></div>
-            </section>
-          </div>
-        </div>
-          <div id="savedTvSection" style="display:none;">
-            <div id="savedTvFilters" class="genre-filter"></div>
-            <div id="savedTvList" class="decision-container"></div>
-          </div>
-          <div id="watchedTvSection" style="display:none;">
-            <div id="watchedTvControls" class="movie-controls">
-              <label for="watchedTvSort">Sort by:</label>
-              <select id="watchedTvSort">
-                <option value="recent">Recently Updated</option>
-                <option value="ratingDesc">Rating: High to Low</option>
-                <option value="ratingAsc">Rating: Low to High</option>
-              </select>
-            </div>
-            <div id="watchedTvList" class="decision-container"></div>
-          </div>
-          <footer class="tmdb-notice">
-            Uses the <a href="https://developer.themoviedb.org/reference/intro/getting-started" target="_blank" rel="noopener noreferrer">TMDB API</a>.
-          </footer>
-        </div>
-      </div>
-
-    <!-- LIVE MUSIC PANEL -->
-      <div id="showsPanel" class="main-layout" style="display:none">
-        <div class="full-column">
-          <div class="panel-header">
-            <h2>Live Music</h2>
-            <button type="button" class="icon-btn tab-hide-btn" title="Hide Tab">🕒</button>
-          </div>
-          <div id="eventbriteStatus" class="shows-status" role="status" aria-live="polite"></div>
-          <details id="eventbriteDebug" class="shows-debug" hidden>
-            <summary>Latest API response</summary>
-            <pre id="eventbriteDebugOutput" class="shows-debug__output" aria-live="polite"></pre>
-          </details>
-          <div id="eventbriteList" class="decision-container"></div>
-        </div>
-      </div>
-    <!-- RESTAURANTS PANEL -->
-      <div id="restaurantsPanel" class="main-layout" style="display:none;">
-        <div class="full-column">
-          <div class="panel-header">
-            <h2>Restaurants</h2>
-            <button type="button" class="icon-btn tab-hide-btn" title="Hide Tab">🕒</button>
-          </div>
-      <div class="restaurants-layout">
-        <div
-          id="restaurantsMap"
-          class="restaurants-map"
-          role="img"
-          aria-label="Map showing nearby restaurant locations"
-        ></div>
-        <div id="restaurantsResults" class="restaurants-list decision-container" aria-live="polite">
-          <div class="restaurants-tabs" role="tablist" aria-label="Restaurant lists">
-            <button
-              type="button"
-              id="restaurantsNearbyTab"
-              class="restaurants-tab is-active"
-              data-view="nearby"
-              role="tab"
-              aria-selected="true"
-              aria-controls="restaurantsNearby"
-            >
-              Feed
-            </button>
-            <button
-              type="button"
-              id="restaurantsSavedTab"
-              class="restaurants-tab"
-              data-view="saved"
-              role="tab"
-              aria-selected="false"
-              aria-controls="restaurantsSaved"
-            >
-              To Visit
-            </button>
-            <button
-              type="button"
-              id="restaurantsFavoritesTab"
-              class="restaurants-tab"
-              data-view="favorites"
-              role="tab"
-              aria-selected="false"
-              aria-controls="restaurantsFavorites"
-            >
-              Favorites
-            </button>
-          </div>
-          <div
-            id="restaurantsNearby"
-            class="restaurants-section"
-            role="tabpanel"
-            aria-labelledby="restaurantsNearbyTab"
-          ></div>
-          <div
-            id="restaurantsSaved"
-            class="restaurants-section"
-            role="tabpanel"
-            aria-labelledby="restaurantsSavedTab"
-            hidden
-          ></div>
-          <div
-            id="restaurantsFavorites"
-            class="restaurants-section"
-            role="tabpanel"
-            aria-labelledby="restaurantsFavoritesTab"
-            hidden
-          ></div>
-          <div id="restaurantsHiddenSection" class="restaurants-hidden" aria-live="polite"></div>
-        </div>
-      </div>
-    </div>
-  </div>
-
   </section>
 
   <nav id="bottomNav" class="bottom-nav">
@@ -365,12 +168,8 @@
     </div>
   </div>
   <script src="https://apis.google.com/js/api.js"></script>
-  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script type="module" src="js/main.js"></script>
   <script type="module" src="js/movies.js"></script>
-  <script type="module" src="js/tv.js"></script>
-  <script type="module" src="js/shows.js"></script>
-  <script type="module" src="js/restaurants.js"></script>
   <script type="module" src="js/weather.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </body>

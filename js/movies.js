@@ -27,7 +27,7 @@ const MOVIE_RATING_BUCKETS = [
 
 const DEFAULT_TMDB_PROXY_ENDPOINT =
   (typeof process !== 'undefined' && process.env && process.env.TMDB_PROXY_ENDPOINT) ||
-  `${DEFAULT_REMOTE_API_BASE}/tmdbProxy`;
+  `${API_BASE_URL.replace(/\/$/, '') || DEFAULT_REMOTE_API_BASE}/tmdbProxy`;
 
 let proxyDisabled = false;
 const unsupportedProxyEndpoints = new Set();

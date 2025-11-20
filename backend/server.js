@@ -30,19 +30,6 @@ movieCatalog
   });
 const PORT = Number(process.env.PORT) || 3003;
 const HOST = process.env.HOST || (process.env.VITEST ? '127.0.0.1' : '0.0.0.0');
-const FOURSQUARE_SEARCH_URL = 'https://api.foursquare.com/v3/places/search';
-const FOURSQUARE_PLACE_URL = 'https://api.foursquare.com/v3/places';
-const FOURSQUARE_CACHE_COLLECTION = 'foursquareCache';
-const FOURSQUARE_CACHE_TTL_MS = 1000 * 60 * 30; // 30 minutes
-const FOURSQUARE_MAX_LIMIT = 50;
-const FOURSQUARE_DETAILS_MAX = 15;
-const FOURSQUARE_DETAILS_CONCURRENCY = 4;
-const FOURSQUARE_CATEGORY_RESTAURANTS = '13065';
-const FOURSQUARE_SEARCH_FIELDS =
-  'fsq_id,name,location,geocodes,distance,link,website,tel,categories,price,rating,rating_signals';
-const FOURSQUARE_DETAIL_FIELDS =
-  'fsq_id,name,location,geocodes,distance,link,website,tel,categories,price,rating,rating_signals,photos,popularity,hours,social_media';
-const METERS_PER_MILE = 1609.34;
 const MOVIE_STATS_BUCKETS = [
   { label: '9-10', min: 9, max: Infinity },
   { label: '8-8.9', min: 8, max: 9 },
@@ -61,6 +48,18 @@ const OMDB_API_KEY =
   '';
 const OMDB_CACHE_COLLECTION = 'omdbRatings';
 const OMDB_CACHE_TTL_MS = 1000 * 60 * 60 * 12; // 12 hours
+const YOUTUBE_SEARCH_BASE_URL = 'https://www.googleapis.com/youtube/v3/search';
+const YOUTUBE_API_KEY =
+  process.env.YOUTUBE_API_KEY ||
+  process.env.YOUTUBE_KEY ||
+  process.env.GOOGLE_API_KEY ||
+  '';
+const YOUTUBE_SEARCH_CACHE_COLLECTION = 'youtubeSearchCache';
+const YOUTUBE_SEARCH_CACHE_TTL_MS = 1000 * 60 * 60 * 6; // 6 hours
+
+const DEFAULT_REMOTE_API_BASE = 'https://narrow-down.web.app/api';
+const DEFAULT_REMOTE_TMDB_PROXY_URL = `${DEFAULT_REMOTE_API_BASE}/tmdbProxy`;
+const TMDB_BASE_URL = 'https://api.themoviedb.org';
 
 async function safeReadCachedResponse(collection, keyParts, ttlMs) {
   try {
@@ -88,8 +87,218 @@ function resolveTmdbApiKey() {
   );
 }
 
-function resolveTmdbProxyEndpoint() {
-  return process.env.TMDB_PROXY_ENDPOINT || '';
+function resolveSelfOrigin(req) {
+  if (!req) return null;
+  const host = req.get('host');
+  if (!host) return null;
+  const protocolHeader = req.headers['x-forwarded-proto'];
+  const forwardedProtocol = Array.isArray(protocolHeader)
+    ? protocolHeader[0]
+    : protocolHeader;
+  const protocol = req.protocol || (forwardedProtocol ? String(forwardedProtocol).split(',')[0].trim() : null) || 'http';
+  return `${protocol}://${host}`;
+}
+
+function resolveTmdbProxyEndpoint(req) {
+  const explicit = process.env.TMDB_PROXY_ENDPOINT;
+  if (explicit) {
+    return explicit;
+  }
+  const origin = resolveSelfOrigin(req);
+  if (origin) {
+    return `${origin.replace(/\/+$/, '')}/tmdbProxy`;
+  }
+  const base =
+    (process.env.API_BASE_URL && process.env.API_BASE_URL.replace(/\/+$/, '')) || '';
+  if (base) {
+    return `${base}/tmdbProxy`;
+  }
+  return '';
+}
+
+function resolveTmdbProxyUpstreamUrl() {
+  const explicit = process.env.TMDB_PROXY_UPSTREAM || process.env.TMDB_REMOTE_PROXY_URL;
+  if (explicit) {
+    return explicit;
+  }
+  const endpoint = process.env.TMDB_PROXY_ENDPOINT;
+  if (endpoint && /^https?:\/\//i.test(endpoint)) {
+    const lowered = endpoint.toLowerCase();
+    if (
+      !lowered.includes('localhost') &&
+      !lowered.includes('127.0.0.1') &&
+      !lowered.includes('::1')
+    ) {
+      return endpoint;
+    }
+  }
+  return DEFAULT_REMOTE_TMDB_PROXY_URL;
+}
+
+const TMDB_ALLOWED_ENDPOINTS = {
+  discover: { path: '/3/discover/movie' },
+  genres: { path: '/3/genre/movie/list' },
+  credits: {
+    path: query => {
+      const rawId = query?.movie_id ?? query?.id ?? query?.movieId;
+      const value = Array.isArray(rawId) ? rawId[0] : rawId;
+      if (!value && value !== 0) return null;
+      const trimmed = String(value).trim();
+      if (!trimmed) return null;
+      return `/3/movie/${encodeURIComponent(trimmed)}/credits`;
+    },
+    omitParams: ['movie_id', 'movieId', 'id']
+  },
+  movie_details: {
+    path: query => {
+      const rawId = query?.movie_id ?? query?.id ?? query?.movieId;
+      const value = Array.isArray(rawId) ? rawId[0] : rawId;
+      if (!value && value !== 0) return null;
+      const trimmed = String(value).trim();
+      if (!trimmed) return null;
+      return `/3/movie/${encodeURIComponent(trimmed)}`;
+    },
+    omitParams: ['movie_id', 'movieId', 'id']
+  },
+  person_details: {
+    path: query => {
+      const rawId = query?.person_id ?? query?.id;
+      const value = Array.isArray(rawId) ? rawId[0] : rawId;
+      if (!value && value !== 0) return null;
+      const trimmed = String(value).trim();
+      if (!trimmed) return null;
+      return `/3/person/${encodeURIComponent(trimmed)}`;
+    },
+    omitParams: ['person_id', 'id']
+  },
+  search_multi: { path: '/3/search/multi' },
+  search_movie: { path: '/3/search/movie' },
+  trending_all: { path: '/3/trending/all/day' },
+  trending_movies: { path: '/3/trending/movie/day' },
+  popular_movies: { path: '/3/movie/popular' },
+  upcoming_movies: { path: '/3/movie/upcoming' }
+};
+
+function buildTmdbPath(endpointKey, query) {
+  const config = TMDB_ALLOWED_ENDPOINTS[endpointKey];
+  if (!config) {
+    const error = new Error('unsupported_endpoint');
+    error.status = 400;
+    throw error;
+  }
+  if (typeof config.path === 'function') {
+    const resolved = config.path(query);
+    if (!resolved) {
+      const error = new Error('invalid_endpoint_params');
+      error.status = 400;
+      throw error;
+    }
+    return resolved;
+  }
+  return config.path;
+}
+
+function buildTmdbSearchParams(query, omit = []) {
+  const params = new URLSearchParams();
+  const omitSet = new Set(omit);
+  Object.entries(query).forEach(([key, value]) => {
+    if (omitSet.has(key)) return;
+    if (value === undefined || value === null) return;
+    if (Array.isArray(value)) {
+      value.forEach(item => {
+        if (item === undefined || item === null) return;
+        params.append(key, String(item));
+      });
+      return;
+    }
+    params.append(key, String(value));
+  });
+  return params;
+}
+
+async function fetchTmdbDirect(endpointKey, query, apiKey) {
+  const path = buildTmdbPath(endpointKey, query);
+  const config = TMDB_ALLOWED_ENDPOINTS[endpointKey] || {};
+  const params = buildTmdbSearchParams(query, config.omitParams || []);
+  params.set('api_key', apiKey);
+  const url = new URL(path, TMDB_BASE_URL);
+  url.search = params.toString();
+  const response = await fetch(url.toString(), {
+    headers: {
+      Accept: 'application/json',
+      'User-Agent': 'narrow-down-local-proxy'
+    }
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    const error = new Error(`TMDB request failed (${response.status})`);
+    error.status = response.status;
+    error.body = text;
+    throw error;
+  }
+  return text ? JSON.parse(text) : {};
+}
+
+async function forwardTmdbProxy(endpointKey, query) {
+  const upstream = resolveTmdbProxyUpstreamUrl();
+  if (!upstream) {
+    const error = new Error('tmdb_proxy_upstream_unavailable');
+    error.status = 502;
+    throw error;
+  }
+  const url = new URL(upstream);
+  url.searchParams.set('endpoint', endpointKey);
+  Object.entries(query).forEach(([key, value]) => {
+    if (value === undefined || value === null) return;
+    if (Array.isArray(value)) {
+      value.forEach(item => {
+        if (item === undefined || item === null) return;
+        url.searchParams.append(key, String(item));
+      });
+      return;
+    }
+    url.searchParams.append(key, String(value));
+  });
+  const response = await fetch(url.toString(), {
+    headers: {
+      Accept: 'application/json',
+      'User-Agent': 'narrow-down-local-proxy'
+    }
+  });
+  const body = await response.text();
+  return {
+    status: response.status,
+    contentType: response.headers.get('content-type'),
+    body
+  };
+}
+
+async function requestTmdbData(endpointKey, query = {}) {
+  const apiKey = resolveTmdbApiKey();
+  if (apiKey) {
+    try {
+      return await fetchTmdbDirect(endpointKey, query, apiKey);
+    } catch (err) {
+      console.warn(`Direct TMDB request failed for ${endpointKey}`, err?.message || err);
+    }
+  }
+  const forwarded = await forwardTmdbProxy(endpointKey, query);
+  if (forwarded.status >= 400) {
+    const error = new Error('tmdb_proxy_forward_failed');
+    error.status = forwarded.status;
+    error.body = forwarded.body;
+    throw error;
+  }
+  if (!forwarded.body) {
+    return {};
+  }
+  try {
+    return JSON.parse(forwarded.body);
+  } catch (err) {
+    const parseError = new Error('invalid_tmdb_proxy_response');
+    parseError.status = 502;
+    throw parseError;
+  }
 }
 
 // Enable CORS for all routes so the frontend can reach the API
@@ -110,6 +319,49 @@ const mailer = (() => {
 })();
 
 app.use(express.json());
+
+async function handleTmdbProxyRequest(req, res) {
+  const endpointKey = String(req.query.endpoint || 'discover');
+  const query = { ...req.query };
+  delete query.endpoint;
+
+  const apiKey = resolveTmdbApiKey();
+  if (apiKey) {
+    try {
+      const data = await fetchTmdbDirect(endpointKey, query, apiKey);
+      res.type('application/json').send(JSON.stringify(data));
+      return;
+    } catch (err) {
+      console.warn('Direct TMDB request failed, attempting upstream proxy', err);
+    }
+  }
+
+  try {
+    const forwarded = await forwardTmdbProxy(endpointKey, query);
+    res.status(forwarded.status);
+    if (forwarded.contentType) {
+      res.set('content-type', forwarded.contentType);
+    } else {
+      res.type('application/json');
+    }
+    if (forwarded.body) {
+      res.send(forwarded.body);
+    } else {
+      res.send('');
+    }
+  } catch (err) {
+    console.error('TMDB proxy request failed', err);
+    const status =
+      err && typeof err.status === 'number' && err.status >= 400 ? err.status : 502;
+    res.status(status).json({
+      error: 'tmdb_proxy_failed',
+      message: (err && err.message) || 'TMDB proxy request failed'
+    });
+  }
+}
+
+app.get('/tmdbProxy', handleTmdbProxyRequest);
+app.get('/api/tmdbProxy', handleTmdbProxyRequest);
 
 function sendCachedResponse(res, cached) {
   if (!cached || typeof cached.body !== 'string') return false;
@@ -135,28 +387,40 @@ function parseNumberQuery(value) {
   return Number.isFinite(num) ? num : null;
 }
 
-function normalizeCoordinate(value, digits = 3) {
-  const num = Number.parseFloat(value);
-  if (!Number.isFinite(num)) return null;
-  const factor = Math.pow(10, Math.max(0, digits));
-  return Math.round(num * factor) / factor;
-}
-
-function clampDays(value) {
-  if (value === undefined || value === null || value === '') {
-    return TICKETMASTER_DEFAULT_DAYS;
-  }
-  const num = Number.parseInt(value, 10);
-  if (!Number.isFinite(num)) return TICKETMASTER_DEFAULT_DAYS;
-  return Math.min(Math.max(num, 1), 31);
-}
-
 function normalizePositiveInteger(value, { min = 1, max = Number.MAX_SAFE_INTEGER } = {}) {
   if (value === undefined || value === null || value === '') return null;
   const parsed = Number.parseInt(value, 10);
   if (!Number.isFinite(parsed) || parsed <= 0) return null;
   const clamped = Math.min(Math.max(parsed, min), max);
   return clamped;
+}
+
+function normalizeYouTubeQuery(value) {
+  if (typeof value !== 'string') return '';
+  return value.replace(/\s+/g, ' ').trim();
+}
+
+function normalizeYouTubeThumbnails(thumbnails) {
+  if (!thumbnails || typeof thumbnails !== 'object') return undefined;
+  const normalized = {};
+  Object.entries(thumbnails).forEach(([key, value]) => {
+    if (!value || typeof value !== 'object') return;
+    const url = typeof value.url === 'string' ? value.url : null;
+    if (!url) return;
+    const width = Number.isFinite(value.width) ? Number(value.width) : null;
+    const height = Number.isFinite(value.height) ? Number(value.height) : null;
+    normalized[key] = {
+      url,
+      width: width === null ? undefined : width,
+      height: height === null ? undefined : height
+    };
+  });
+  return Object.keys(normalized).length ? normalized : undefined;
+}
+
+function youtubeSearchCacheKey(query) {
+  const normalized = normalizeYouTubeQuery(query).toLowerCase();
+  return ['youtubeSearch', normalized];
 }
 
 function parseOmdbPercent(value) {
@@ -167,6 +431,32 @@ function parseOmdbPercent(value) {
   const num = Number.parseFloat(normalized);
   if (!Number.isFinite(num)) return null;
   return Math.max(0, Math.min(100, Math.round(num)));
+}
+
+function extractYear(value) {
+  if (typeof value !== 'string') return null;
+  const match = value.trim().match(/^(\d{4})/);
+  if (!match) return null;
+  const year = Number(match[1]);
+  return Number.isFinite(year) ? year : null;
+}
+
+function parseIdSet(raw) {
+  const set = new Set();
+  const addParts = value => {
+    if (!value && value !== 0) return;
+    String(value)
+      .split(/[,|\s]+/)
+      .map(part => part.trim())
+      .filter(Boolean)
+      .forEach(part => set.add(part));
+  };
+  if (Array.isArray(raw)) {
+    raw.forEach(addParts);
+  } else if (typeof raw === 'string') {
+    addParts(raw);
+  }
+  return set;
 }
 
 function parseOmdbScore(value) {
@@ -253,227 +543,6 @@ function normalizeOmdbPayload(data, { type, requestedTitle, requestedYear }) {
   return payload;
 }
 
-function foursquareCacheKeyParts({ city, latitude, longitude, cuisine, limit, radiusMeters }) {
-  const normalizedCity = typeof city === 'string' ? city.trim().toLowerCase() : '';
-  const normalizedCuisine = typeof cuisine === 'string' ? cuisine.trim().toLowerCase() : '';
-  const hasCoords = Number.isFinite(latitude) && Number.isFinite(longitude);
-  const parts = ['foursquare', 'v1'];
-  if (hasCoords) {
-    const lat = Number(latitude);
-    const lon = Number(longitude);
-    parts.push(`coords:${lat.toFixed(4)},${lon.toFixed(4)}`);
-  } else {
-    parts.push('coords:none');
-  }
-  if (normalizedCity) {
-    parts.push(`city:${normalizedCity}`);
-  }
-  if (normalizedCuisine) {
-    parts.push(`cuisine:${normalizedCuisine}`);
-  }
-  if (Number.isFinite(limit) && limit > 0) {
-    const clampedLimit = Math.min(Math.max(1, Math.floor(limit)), FOURSQUARE_MAX_LIMIT);
-    parts.push(`limit:${clampedLimit}`);
-  } else {
-    parts.push('limit:default');
-  }
-  if (Number.isFinite(radiusMeters) && radiusMeters > 0) {
-    parts.push(`radius:${Math.round(radiusMeters)}`);
-  } else {
-    parts.push('radius:none');
-  }
-  return parts;
-}
-
-function formatFoursquarePrice(level) {
-  if (!Number.isFinite(level) || level <= 0) return '';
-  const clamped = Math.max(1, Math.min(4, Math.round(level)));
-  return '$'.repeat(clamped);
-}
-
-function buildFoursquareAddress(location) {
-  if (!location || typeof location !== 'object') return '';
-  if (typeof location.formatted_address === 'string' && location.formatted_address.trim()) {
-    return location.formatted_address.trim();
-  }
-  const locality =
-    [location.locality || location.city || '', location.region || location.state || '']
-      .filter(Boolean)
-      .join(', ');
-  const parts = [
-    location.address || location.address_line1 || '',
-    locality,
-    location.postcode || '',
-    location.country || ''
-  ]
-    .map(part => (typeof part === 'string' ? part.trim() : ''))
-    .filter(Boolean);
-  return parts.join(', ');
-}
-
-function extractBestPhotoUrl(detail) {
-  const photos = detail && Array.isArray(detail.photos) ? detail.photos : [];
-  if (!photos.length) return '';
-  const preferred =
-    photos.find(photo => photo && photo.prefix && photo.suffix && photo.width && photo.height) ||
-    photos.find(photo => photo && photo.prefix && photo.suffix);
-  if (!preferred || !preferred.prefix || !preferred.suffix) {
-    return '';
-  }
-  const size =
-    Number.isFinite(preferred.width) && Number.isFinite(preferred.height)
-      ? `${preferred.width}x${preferred.height}`
-      : 'original';
-  return `${preferred.prefix}${size}${preferred.suffix}`;
-}
-
-function simplifyFoursquareCategories(categories) {
-  if (!Array.isArray(categories)) return [];
-  return categories
-    .map(category => {
-      if (!category) return '';
-      if (typeof category === 'string') return category.trim();
-      if (typeof category.name === 'string' && category.name.trim()) return category.name.trim();
-      if (typeof category.short_name === 'string' && category.short_name.trim()) {
-        return category.short_name.trim();
-      }
-      return '';
-    })
-    .filter(Boolean);
-}
-
-async function fetchFoursquareSearch(params, apiKey) {
-  const url = `${FOURSQUARE_SEARCH_URL}?${params.toString()}`;
-  const response = await fetch(url, {
-    headers: {
-      Authorization: apiKey,
-      Accept: 'application/json'
-    }
-  });
-  if (!response.ok) {
-    const text = await response.text();
-    throw Object.assign(
-      new Error(`Foursquare request failed: ${response.status} ${text.slice(0, 200)}`),
-      { status: response.status }
-    );
-  }
-  return response.json();
-}
-
-async function fetchFoursquareDetails(
-  places,
-  apiKey,
-  { limit = FOURSQUARE_DETAILS_MAX, concurrency = FOURSQUARE_DETAILS_CONCURRENCY } = {}
-) {
-  if (!Array.isArray(places) || !places.length) return new Map();
-  const ids = [];
-  const seen = new Set();
-  for (const place of places) {
-    const id = place?.fsq_id;
-    if (!id || seen.has(id)) continue;
-    seen.add(id);
-    ids.push(id);
-    if (Number.isFinite(limit) && limit > 0 && ids.length >= limit) break;
-  }
-  if (!ids.length) return new Map();
-
-  const results = new Map();
-  const workerCount = Math.max(1, Math.min(concurrency || 1, ids.length));
-  let index = 0;
-
-  async function runWorker() {
-    while (index < ids.length) {
-      const currentIndex = index++;
-      const id = ids[currentIndex];
-      const detailUrl = `${FOURSQUARE_PLACE_URL}/${encodeURIComponent(
-        id
-      )}?fields=${encodeURIComponent(FOURSQUARE_DETAIL_FIELDS)}`;
-      try {
-        const response = await fetch(detailUrl, {
-          headers: {
-            Authorization: apiKey,
-            Accept: 'application/json'
-          }
-        });
-        if (!response.ok) {
-          continue;
-        }
-        const data = await response.json().catch(() => null);
-        if (data && typeof data === 'object') {
-          results.set(id, data);
-        }
-      } catch (err) {
-        console.error('Foursquare detail fetch failed', err);
-      }
-    }
-  }
-
-  await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
-  return results;
-}
-
-function simplifyFoursquarePlace(place, detail) {
-  if (!place || typeof place !== 'object') return null;
-  const location = detail?.location || place.location || {};
-  const geocodes = detail?.geocodes || place.geocodes || {};
-  const mainGeo = geocodes.main || geocodes.roof || geocodes.display || {};
-  const latitude = Number.isFinite(mainGeo.latitude) ? mainGeo.latitude : null;
-  const longitude = Number.isFinite(mainGeo.longitude) ? mainGeo.longitude : null;
-
-  const rawRating =
-    Number.isFinite(detail?.rating) && detail.rating > 0
-      ? detail.rating
-      : Number.isFinite(place.rating) && place.rating > 0
-      ? place.rating
-      : null;
-  const normalizedRating =
-    Number.isFinite(rawRating) && rawRating > 0 ? Math.round((rawRating / 2) * 10) / 10 : null;
-
-  const ratingSignals =
-    Number.isFinite(detail?.rating_signals) && detail.rating_signals >= 0
-      ? detail.rating_signals
-      : Number.isFinite(place.rating_signals) && place.rating_signals >= 0
-      ? place.rating_signals
-      : null;
-
-  const priceLevel =
-    Number.isFinite(detail?.price) && detail.price > 0
-      ? detail.price
-      : Number.isFinite(place.price) && place.price > 0
-      ? place.price
-      : null;
-
-  const address = buildFoursquareAddress(location);
-  const categories = simplifyFoursquareCategories(detail?.categories || place.categories);
-  const phone = detail?.tel || place.tel || '';
-  const website = detail?.website || place.website || '';
-  const link = detail?.link || place.link || '';
-  const url = website || link || (place.fsq_id ? `https://foursquare.com/v/${place.fsq_id}` : '');
-  const distance = Number.isFinite(place.distance) ? place.distance : null;
-  const imageUrl = extractBestPhotoUrl(detail);
-
-  return {
-    id: place.fsq_id || detail?.fsq_id || null,
-    name: detail?.name || place.name || 'Unnamed Venue',
-    address,
-    city: location.locality || location.city || '',
-    state: location.region || location.state || '',
-    zip: location.postcode || '',
-    country: location.country || '',
-    phone,
-    rating: normalizedRating,
-    reviewCount: Number.isFinite(ratingSignals) ? ratingSignals : null,
-    price: formatFoursquarePrice(priceLevel),
-    categories,
-    latitude,
-    longitude,
-    url,
-    website: website || undefined,
-    imageUrl: imageUrl || undefined,
-    distance
-  };
-}
-
 const plaidClient = (() => {
   const clientID = process.env.PLAID_CLIENT_ID;
   const secret = process.env.PLAID_SECRET;
@@ -492,7 +561,7 @@ const plaidClient = (() => {
 })();
 
 // Serve static files (like index.html, style.css, script.js)
-// Allow API routes (like /api/eventbrite) to continue past the static middleware
+// Allow API routes to continue past the static middleware
 // when no matching asset is found. Express 5 changes the default `fallthrough`
 // behavior, so we explicitly enable it to avoid returning a 404 before our API
 // handlers get a chance to run.
@@ -596,17 +665,12 @@ app.get('/api/spotify-client-id', (req, res) => {
   if (!clientId) {
     return res.status(500).json({ error: 'missing' });
   }
-  const hasEventbriteToken = Boolean(
-    process.env.EVENTBRITE_TOKEN ||
-    process.env.EVENTBRITE_API_TOKEN ||
-    process.env.EVENTBRITE_OAUTH_TOKEN
-  );
-  res.json({ clientId, hasEventbriteToken });
+  res.json({ clientId });
 });
 
 app.get('/api/tmdb-config', (req, res) => {
   const apiKey = resolveTmdbApiKey();
-  const proxyEndpoint = resolveTmdbProxyEndpoint();
+  const proxyEndpoint = resolveTmdbProxyEndpoint(req);
 
   if (!apiKey && !proxyEndpoint) {
     return res.status(404).json({ error: 'tmdb_config_unavailable' });
@@ -627,496 +691,108 @@ app.get('/api/tmdb-config', (req, res) => {
   res.json(payload);
 });
 
-app.get('/api/restaurants', async (req, res) => {
-  const { city, cuisine = '' } = req.query || {};
-  const latitude = Number.parseFloat(req.query?.latitude);
-  const longitude = Number.parseFloat(req.query?.longitude);
-  const foursquareKey =
-    req.get('x-api-key') || req.query.apiKey || process.env.FOURSQUARE_API_KEY;
-  if (!foursquareKey) {
-    return res.status(500).json({ error: 'missing foursquare api key' });
-  }
-  const hasCoords = Number.isFinite(latitude) && Number.isFinite(longitude);
-  if (!hasCoords && !city) {
-    return res.status(400).json({ error: 'missing location' });
+app.get('/api/youtube/search', async (req, res) => {
+  const rawQuery =
+    req.query.q ?? req.query.query ?? req.query.term ?? req.query.artist ?? req.query.name ?? '';
+  const query = normalizeYouTubeQuery(rawQuery);
+
+  if (!query) {
+    return res.status(400).json({ error: 'missing_query' });
   }
 
-  const rawLimitParam = req.query?.limit ?? req.query?.maxResults;
-  const requestedLimit = normalizePositiveInteger(rawLimitParam, {
-    min: 1,
-    max: FOURSQUARE_MAX_LIMIT
-  });
-  const limit = requestedLimit || FOURSQUARE_MAX_LIMIT;
+  if (!YOUTUBE_API_KEY) {
+    return res.status(501).json({ error: 'youtube_api_key_missing' });
+  }
 
-  const parsedRadius = parseNumberQuery(req.query?.radius);
-  const radiusMiles =
-    Number.isFinite(parsedRadius) && parsedRadius > 0 ? Math.min(parsedRadius, 25) : null;
-  const radiusMeters =
-    Number.isFinite(radiusMiles) && radiusMiles > 0 ? Math.round(radiusMiles * METERS_PER_MILE) : null;
-
-  const cacheKeyParts = foursquareCacheKeyParts({
-    city,
-    latitude,
-    longitude,
-    cuisine,
-    limit,
-    radiusMeters
-  });
-
+  const cacheKey = youtubeSearchCacheKey(query);
   const cached = await safeReadCachedResponse(
-    FOURSQUARE_CACHE_COLLECTION,
-    cacheKeyParts,
-    FOURSQUARE_CACHE_TTL_MS
+    YOUTUBE_SEARCH_CACHE_COLLECTION,
+    cacheKey,
+    YOUTUBE_SEARCH_CACHE_TTL_MS
   );
   if (sendCachedResponse(res, cached)) {
     return;
   }
 
-  try {
-    const searchLimit = Math.min(
-      FOURSQUARE_MAX_LIMIT,
-      Math.max(limit, FOURSQUARE_DETAILS_MAX)
-    );
-    const params = new URLSearchParams();
-    params.set('limit', String(searchLimit));
-    params.set('categories', FOURSQUARE_CATEGORY_RESTAURANTS);
-    params.set('fields', FOURSQUARE_SEARCH_FIELDS);
-    if (hasCoords) {
-      params.set('ll', `${latitude},${longitude}`);
-      if (Number.isFinite(radiusMeters) && radiusMeters > 0) {
-        params.set('radius', String(radiusMeters));
-      }
-      params.set('sort', 'DISTANCE');
-    } else if (city) {
-      params.set('near', String(city));
-      params.set('sort', 'RELEVANCE');
-    }
-    if (cuisine) {
-      params.set('query', String(cuisine));
-    }
-
-    const data = await fetchFoursquareSearch(params, foursquareKey);
-    const results = Array.isArray(data?.results) ? data.results : [];
-    if (!results.length) {
-      const emptyPayload = JSON.stringify([]);
-      await safeWriteCachedResponse(FOURSQUARE_CACHE_COLLECTION, cacheKeyParts, {
-        status: 200,
-        contentType: 'application/json',
-        body: emptyPayload,
-        metadata: {
-          city: typeof city === 'string' ? city : '',
-          hasCoords,
-          latitude: hasCoords ? latitude : null,
-          longitude: hasCoords ? longitude : null,
-          cuisine: typeof cuisine === 'string' ? cuisine : '',
-          limit,
-          returned: 0,
-          totalResults: Array.isArray(data?.results) ? data.results.length : 0,
-          radiusMeters: Number.isFinite(radiusMeters) ? radiusMeters : null
-        }
-      });
-      res.type('application/json').send(emptyPayload);
-      return;
-    }
-
-    const details = await fetchFoursquareDetails(results, foursquareKey);
-    const simplified = results
-      .slice(0, limit)
-      .map(place => simplifyFoursquarePlace(place, details.get(place.fsq_id)))
-      .filter(Boolean);
-
-    const payload = JSON.stringify(simplified);
-
-    await safeWriteCachedResponse(FOURSQUARE_CACHE_COLLECTION, cacheKeyParts, {
-      status: 200,
-      contentType: 'application/json',
-      body: payload,
-      metadata: {
-        city: typeof city === 'string' ? city : '',
-        hasCoords,
-        latitude: hasCoords ? latitude : null,
-        longitude: hasCoords ? longitude : null,
-        cuisine: typeof cuisine === 'string' ? cuisine : '',
-        limit,
-        returned: simplified.length,
-        totalResults: Array.isArray(data?.results) ? data.results.length : null,
-        radiusMeters: Number.isFinite(radiusMeters) ? radiusMeters : null
-      }
-    });
-
-    res.type('application/json').send(payload);
-  } catch (err) {
-    console.error('Foursquare restaurant search failed', err);
-    const status =
-      err && typeof err.status === 'number' && err.status >= 400 ? err.status : 500;
-    const message =
-      err && typeof err.message === 'string' && err.message ? err.message : 'failed';
-    res.status(status).json({ error: message });
-  }
-});
-
-// --- Ticketmaster shows proxy ---
-const TICKETMASTER_API_KEY =
-  process.env.TICKETMASTER_API_KEY ||
-  process.env.TICKETMASTER_KEY ||
-  process.env.TICKETMASTER_CONSUMER_KEY ||
-  '';
-const TICKETMASTER_API_URL = 'https://app.ticketmaster.com/discovery/v2/events.json';
-const TICKETMASTER_CACHE_COLLECTION = 'ticketmasterCache';
-const TICKETMASTER_CACHE_TTL_MS = 1000 * 60 * 15; // 15 minutes
-const TICKETMASTER_CACHE_VERSION = 'v1';
-const TICKETMASTER_MAX_RADIUS_MILES = 150;
-const TICKETMASTER_DEFAULT_RADIUS = 100;
-const TICKETMASTER_DEFAULT_DAYS = 14;
-const TICKETMASTER_PAGE_SIZE = 100;
-const TICKETMASTER_SEGMENTS = [
-  { key: 'music', description: 'Live music', params: { classificationName: 'Music' } },
-  { key: 'comedy', description: 'Comedy', params: { classificationName: 'Comedy' } }
-];
-
-function ticketmasterCacheKeyParts({ latitude, longitude, radiusMiles, startDateTime, endDateTime }) {
-  const lat = Number.isFinite(latitude) ? latitude.toFixed(4) : 'lat:none';
-  const lon = Number.isFinite(longitude) ? longitude.toFixed(4) : 'lon:none';
-  const radius = Number.isFinite(radiusMiles) ? radiusMiles.toFixed(1) : 'radius:none';
-  return [
-    'ticketmaster',
-    TICKETMASTER_CACHE_VERSION,
-    `lat:${lat}`,
-    `lon:${lon}`,
-    `radius:${radius}`,
-    `start:${startDateTime || ''}`,
-    `end:${endDateTime || ''}`
-  ];
-}
-
-function formatTicketmasterEvent(event, segmentKey) {
-  if (!event || event.id == null) return null;
-  const id = String(event.id);
-  const start = event.dates && event.dates.start ? event.dates.start : {};
-  const embeddedVenue = event._embedded && Array.isArray(event._embedded.venues)
-    ? event._embedded.venues[0]
-    : null;
-  const venue = embeddedVenue || {};
-  const city = venue.city && venue.city.name ? venue.city.name : '';
-  const region =
-    (venue.state && (venue.state.stateCode || venue.state.name)) ||
-    '';
-  const country =
-    (venue.country && (venue.country.countryCode || venue.country.name)) ||
-    '';
-  const localDateTime = start.dateTime || (start.localDate ? `${start.localDate}${start.localTime ? 'T' + start.localTime : 'T00:00:00'}` : null);
-  let localIso = null;
-  if (localDateTime) {
-    const parsed = new Date(localDateTime);
-    if (!Number.isNaN(parsed.getTime())) {
-      localIso = parsed.toISOString();
-    }
-  }
-  const utcIso = start.dateTime ? new Date(start.dateTime).toISOString() : null;
-  const distance = Number.isFinite(event.distance) ? Number(event.distance) : null;
-  const classificationNameSet = new Set();
-  const classifications = Array.isArray(event.classifications)
-    ? event.classifications.map(cls => {
-        const normalized = {
-          primary: Boolean(cls?.primary),
-          segment: cls?.segment || null,
-          genre: cls?.genre || null,
-          subGenre: cls?.subGenre || null,
-          type: cls?.type || null,
-          subType: cls?.subType || null
-        };
-        [
-          normalized.segment?.name,
-          normalized.genre?.name,
-          normalized.subGenre?.name,
-          normalized.type?.name,
-          normalized.subType?.name
-        ]
-          .map(name => (typeof name === 'string' ? name.trim() : ''))
-          .filter(Boolean)
-          .forEach(name => classificationNameSet.add(name));
-        return normalized;
-      })
-    : [];
-
-  const attractions = Array.isArray(event?._embedded?.attractions)
-    ? event._embedded.attractions.map(attraction => {
-        const homepage =
-          Array.isArray(attraction?.externalLinks?.homepage) &&
-          attraction.externalLinks.homepage.length
-            ? attraction.externalLinks.homepage[0].url
-            : null;
-        return {
-          id: attraction?.id || null,
-          name: attraction?.name || '',
-          type: attraction?.type || null,
-          url: attraction?.url || homepage || null,
-          locale: attraction?.locale || null,
-          classifications: Array.isArray(attraction?.classifications)
-            ? attraction.classifications
-            : null
-        };
-      })
-    : [];
-
-  const images = Array.isArray(event?.images)
-    ? event.images.map(image => ({
-        url: image?.url || null,
-        ratio: image?.ratio || null,
-        width: Number.isFinite(image?.width) ? image.width : null,
-        height: Number.isFinite(image?.height) ? image.height : null,
-        fallback: Boolean(image?.fallback)
-      }))
-    : [];
-
-  const ticketmasterDetails = {
-    raw: event,
-    classifications: classifications.length ? classifications : undefined,
-    priceRanges: Array.isArray(event.priceRanges) && event.priceRanges.length ? event.priceRanges : undefined,
-    products: Array.isArray(event.products) && event.products.length ? event.products : undefined,
-    promoter: event.promoter || undefined,
-    promoters: Array.isArray(event.promoters) && event.promoters.length ? event.promoters : undefined,
-    promotions: Array.isArray(event.promotions) && event.promotions.length ? event.promotions : undefined,
-    sales: event.sales || undefined,
-    seatmap: event.seatmap || undefined,
-    ticketLimit: event.ticketLimit || undefined,
-    outlets: Array.isArray(event.outlets) && event.outlets.length ? event.outlets : undefined,
-    accessibility: event.accessibility || undefined,
-    ageRestrictions: event.ageRestrictions || undefined,
-    images: images.length ? images : undefined,
-    attractions: attractions.length ? attractions : undefined,
-    info: event.info || undefined,
-    pleaseNote: event.pleaseNote || undefined
-  };
-
-  Object.keys(ticketmasterDetails).forEach(key => {
-    const value = ticketmasterDetails[key];
-    if (
-      value === undefined ||
-      (Array.isArray(value) && value.length === 0) ||
-      (value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length === 0)
-    ) {
-      delete ticketmasterDetails[key];
-    }
-  });
-
-  const formatted = {
-    id,
-    name: { text: event.name || '' },
-    start: { local: localIso, utc: utcIso },
-    url: event.url || '',
-    venue: {
-      name: venue.name || '',
-      address: {
-        city,
-        region,
-        country
-      }
-    },
-    segment: segmentKey || null,
-    distance,
-    summary: event.info || event.pleaseNote || '',
-    source: 'ticketmaster',
-    genres: Array.from(classificationNameSet)
-  };
-
-  if (Object.keys(ticketmasterDetails).length) {
-    formatted.ticketmaster = ticketmasterDetails;
-  }
-
-  return formatted;
-}
-
-async function fetchTicketmasterSegment({ latitude, longitude, radiusMiles, startDateTime, endDateTime, segment }) {
   const params = new URLSearchParams({
-    apikey: TICKETMASTER_API_KEY,
-    latlong: `${latitude},${longitude}`,
-    radius: String(radiusMiles),
-    unit: 'miles',
-    size: String(TICKETMASTER_PAGE_SIZE),
-    sort: 'date,asc',
-    startDateTime,
-    endDateTime
+    key: YOUTUBE_API_KEY,
+    part: 'snippet',
+    type: 'video',
+    maxResults: '1',
+    videoEmbeddable: 'true',
+    videoSyndicated: 'true',
+    safeSearch: 'moderate',
+    q: query
   });
-  Object.entries(segment.params || {}).forEach(([key, value]) => {
-    if (value != null) params.set(key, value);
-  });
-  const url = `${TICKETMASTER_API_URL}?${params.toString()}`;
-  const response = await fetch(url);
-  const text = await response.text();
-  if (!response.ok) {
-    const err = new Error(text || `Ticketmaster request failed: ${response.status}`);
-    err.status = response.status;
-    err.requestUrl = url;
-    err.responseText = text;
-    throw err;
+
+  const url = `${YOUTUBE_SEARCH_BASE_URL}?${params.toString()}`;
+
+  let response;
+  let text;
+
+  try {
+    response = await fetch(url);
+    text = await response.text();
+  } catch (err) {
+    console.error('YouTube search request failed', { query, err });
+    return res.status(502).json({ error: 'youtube_search_failed' });
   }
+
+  if (!response.ok) {
+    console.error(
+      'YouTube search responded with error',
+      response.status,
+      text ? text.slice(0, 200) : ''
+    );
+    return res.status(response.status).json({ error: 'youtube_search_error' });
+  }
+
   let data;
   try {
-    data = text ? JSON.parse(text) : {};
-  } catch (parseErr) {
-    const err = new Error('Ticketmaster response was not valid JSON');
-    err.status = response.status;
-    err.requestUrl = url;
-    err.responseText = text;
-    throw err;
-  }
-  const events = Array.isArray(data?._embedded?.events) ? data._embedded.events : [];
-  const formatted = events.map(event => formatTicketmasterEvent(event, segment.key)).filter(Boolean);
-  return {
-    events: formatted,
-    summary: {
-      key: segment.key,
-      description: segment.description,
-      status: response.status,
-      total: formatted.length,
-      requestUrl: url,
-      rawTotal: typeof data?.page?.totalElements === 'number' ? data.page.totalElements : null
-    }
-  };
-}
-
-app.get('/api/shows', async (req, res) => {
-  const rawLat = req.query.lat ?? req.query.latitude;
-  const rawLon = req.query.lon ?? req.query.longitude;
-  const latitude = normalizeCoordinate(rawLat, 4);
-  const longitude = normalizeCoordinate(rawLon, 4);
-  if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) {
-    return res.status(400).json({ error: 'missing_coordinates' });
+    data = text ? JSON.parse(text) : null;
+  } catch (err) {
+    console.error('Failed to parse YouTube search response as JSON', err);
+    return res.status(502).json({ error: 'youtube_response_invalid' });
   }
 
-  if (!TICKETMASTER_API_KEY) {
-    return res.status(500).json({ error: 'ticketmaster_api_key_missing' });
-  }
+  const items = Array.isArray(data?.items) ? data.items : [];
+  const bestItem = items.find(item => item?.id?.videoId);
 
-  const parsedRadius = parseNumberQuery(req.query.radius);
-  const radiusMiles = Number.isFinite(parsedRadius) && parsedRadius > 0
-    ? Math.min(Math.max(parsedRadius, 1), TICKETMASTER_MAX_RADIUS_MILES)
-    : TICKETMASTER_DEFAULT_RADIUS;
-
-  const lookaheadDays = clampDays(req.query.days) || TICKETMASTER_DEFAULT_DAYS;
-
-  const startDate = new Date();
-  const startDateTime = startDate.toISOString().split('.')[0] + 'Z';
-  const endDate = new Date(startDate);
-  endDate.setUTCDate(endDate.getUTCDate() + lookaheadDays);
-  const endDateTime = endDate.toISOString().split('.')[0] + 'Z';
-
-  const cacheKey = ticketmasterCacheKeyParts({
-    latitude,
-    longitude,
-    radiusMiles,
-    startDateTime,
-    endDateTime
-  });
-
-  const cached = await safeReadCachedResponse(
-    TICKETMASTER_CACHE_COLLECTION,
-    cacheKey,
-    TICKETMASTER_CACHE_TTL_MS
-  );
-  if (sendCachedResponse(res, cached)) {
-    return;
-  }
-
-  const segmentResults = await Promise.all(
-    TICKETMASTER_SEGMENTS.map(segment =>
-      fetchTicketmasterSegment({
-        latitude,
-        longitude,
-        radiusMiles,
-        startDateTime,
-        endDateTime,
-        segment
-      }).catch(error => ({ error, segment }))
-    )
-  );
-
-  const combined = new Map();
-  const segmentSummaries = [];
-  let successful = false;
-
-  for (const result of segmentResults) {
-    if (result.error) {
-      const { error, segment } = result;
-      console.error('Ticketmaster segment fetch failed', segment.description || segment.key, error);
-      segmentSummaries.push({
-        key: segment.key,
-        description: segment.description,
-        ok: false,
-        status: typeof error.status === 'number' ? error.status : null,
-        error: error.message || 'Request failed',
-        requestUrl: error.requestUrl || null
-      });
-      continue;
-    }
-
-    successful = true;
-    segmentSummaries.push({
-      key: result.summary.key,
-      description: result.summary.description,
-      ok: true,
-      status: result.summary.status,
-      total: result.summary.total,
-      requestUrl: result.summary.requestUrl,
-      rawTotal: result.summary.rawTotal
-    });
-
-    for (const event of result.events) {
-      if (!event || event.id == null) continue;
-      const key = String(event.id);
-      if (!combined.has(key)) {
-        combined.set(key, event);
-      }
-    }
-  }
-
-  if (!successful) {
-    return res.status(502).json({
-      error: 'ticketmaster_fetch_failed',
-      segments: segmentSummaries
-    });
-  }
-
-  const events = Array.from(combined.values()).sort((a, b) => {
-    const aTime = a.start && a.start.utc ? Date.parse(a.start.utc) : (a.start && a.start.local ? Date.parse(a.start.local) : Infinity);
-    const bTime = b.start && b.start.utc ? Date.parse(b.start.utc) : (b.start && b.start.local ? Date.parse(b.start.local) : Infinity);
-    if (Number.isFinite(aTime) && Number.isFinite(bTime)) {
-      if (aTime !== bTime) return aTime - bTime;
-    } else if (Number.isFinite(aTime)) {
-      return -1;
-    } else if (Number.isFinite(bTime)) {
-      return 1;
-    }
-    const aDistance = Number.isFinite(a.distance) ? a.distance : Infinity;
-    const bDistance = Number.isFinite(b.distance) ? b.distance : Infinity;
-    return aDistance - bDistance;
-  });
+  const snippet = bestItem?.snippet && typeof bestItem.snippet === 'object' ? bestItem.snippet : {};
+  const videoId = typeof bestItem?.id?.videoId === 'string' ? bestItem.id.videoId.trim() : '';
 
   const payload = {
-    source: 'ticketmaster',
-    generatedAt: new Date().toISOString(),
-    cached: false,
-    radiusMiles,
-    lookaheadDays,
-    events,
-    segments: segmentSummaries
+    query,
+    video: videoId
+      ? {
+          id: videoId,
+          title: typeof snippet.title === 'string' ? snippet.title : '',
+          description: typeof snippet.description === 'string' ? snippet.description : '',
+          channel: {
+            id: typeof snippet.channelId === 'string' ? snippet.channelId : '',
+            title: typeof snippet.channelTitle === 'string' ? snippet.channelTitle : ''
+          },
+          publishedAt: typeof snippet.publishedAt === 'string' ? snippet.publishedAt : '',
+          thumbnails: normalizeYouTubeThumbnails(snippet.thumbnails),
+          url: `https://www.youtube.com/watch?v=${encodeURIComponent(videoId)}`,
+          embedUrl: `https://www.youtube.com/embed/${encodeURIComponent(videoId)}`
+        }
+      : null
   };
 
-  await safeWriteCachedResponse(TICKETMASTER_CACHE_COLLECTION, cacheKey, {
+  const body = JSON.stringify(payload);
+
+  await safeWriteCachedResponse(YOUTUBE_SEARCH_CACHE_COLLECTION, cacheKey, {
     status: 200,
     contentType: 'application/json',
-    body: JSON.stringify(payload),
-    metadata: {
-      radiusMiles,
-      lookaheadDays,
-      cachedAt: new Date().toISOString(),
-      segments: segmentSummaries
-    }
+    body,
+    metadata: { query, fetchedAt: new Date().toISOString() }
   });
 
-  res.json(payload);
+  res.set('Cache-Control', 'public, max-age=1800');
+  res.type('application/json').send(body);
 });
+
 // --- GeoLayers game endpoints ---
 const layerOrder = ['rivers','lakes','elevation','roads','outline','cities','label'];
 const countriesPath = path.join(__dirname, '../geolayers-game/public/countries.json');
