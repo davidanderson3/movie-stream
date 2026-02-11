@@ -129,58 +129,40 @@ describe('linkify', () => {
 });
 
 describe('loadDecisions caching behavior', () => {
-  it('fetches real data after anonymous call', async () => {
-    const { loadDecisions } = await import('../js/helpers.js');
-    const { SAMPLE_DECISIONS } = await import('../js/sampleData.js');
-
+  it('returns empty data for anonymous users', async () => {
+    const { loadDecisions, clearDecisionsCache } = await import('../js/helpers.js');
     currentUser = null;
+    clearDecisionsCache();
     collectionMock.mockClear();
     getMock.mockClear();
 
-    const anon = await loadDecisions();
-    expect(anon.length).toBe(SAMPLE_DECISIONS.length);
-    const scheduled = anon.filter(i => i.scheduled);
-    expect(scheduled.length).toBeGreaterThan(1);
-    scheduled.forEach(i => {
-      expect(new Date(i.scheduled).getTime()).toBeGreaterThan(Date.now());
-      if (i.scheduledEnd) {
-        expect(new Date(i.scheduledEnd).getTime()).toBeGreaterThan(Date.now());
-      }
-    });
-    expect(collectionMock).toHaveBeenCalledWith('sample');
-
-    currentUser = { uid: 'user1' };
-    collectionMock.mockClear();
-    getMock.mockResolvedValueOnce({ data: () => ({ items: [{ id: '1', text: 't' }] }) });
-
-    const auth = await loadDecisions(true);
-    expect(auth).toEqual([{ id: '1', text: 't' }]);
-    expect(collectionMock).toHaveBeenCalledWith('decisions');
+    const anon = await loadDecisions(true);
+    expect(anon).toEqual([]);
+    expect(collectionMock).not.toHaveBeenCalled();
+    expect(getMock).not.toHaveBeenCalled();
   });
 
-  it('merges stored anonymous items with default sample data', async () => {
+  it('uses cache unless forceRefresh is requested', async () => {
     const { loadDecisions, clearDecisionsCache } = await import('../js/helpers.js');
-    const { SAMPLE_DECISIONS } = await import('../js/sampleData.js');
 
-    currentUser = null;
-    collectionMock.mockClear();
-    docMock = vi.fn(name => ({
-      get: () => Promise.resolve({ data: () => (name === 'sample' ? { items: [{ id: 'extra', type: 'goal', text: 'Extra', parentGoalId: null }] } : undefined) }),
-      set: vi.fn()
-    }));
-    collectionMock = vi.fn(name => ({ doc: () => docMock(name) }));
+    currentUser = { uid: 'user1' };
     clearDecisionsCache();
+    collectionMock.mockClear();
+    getMock.mockClear();
 
-    const merged = await loadDecisions(true);
-    expect(merged.some(i => i.id === 'extra')).toBe(true);
-    expect(merged.some(i => i.id === SAMPLE_DECISIONS[0].id)).toBe(true);
-    expect(merged.length).toBe(SAMPLE_DECISIONS.length + 1);
+    getMock
+      .mockResolvedValueOnce({ data: () => ({ items: [{ id: '1', text: 'first' }] }) })
+      .mockResolvedValueOnce({ data: () => ({ items: [{ id: '2', text: 'second' }] }) });
 
-    docMock = vi.fn(name => ({
-      get: name === 'decisions' ? getMock : vi.fn(() => Promise.resolve({ data: () => undefined })),
-      set: vi.fn()
-    }));
-    collectionMock = vi.fn(name => ({ doc: () => docMock(name) }));
+    const first = await loadDecisions(true);
+    const cached = await loadDecisions();
+    const refreshed = await loadDecisions(true);
+
+    expect(first).toEqual([{ id: '1', text: 'first' }]);
+    expect(cached).toEqual([{ id: '1', text: 'first' }]);
+    expect(refreshed).toEqual([{ id: '2', text: 'second' }]);
+    expect(collectionMock).toHaveBeenCalledWith('decisions');
+    expect(getMock).toHaveBeenCalledTimes(2);
   });
 });
 
