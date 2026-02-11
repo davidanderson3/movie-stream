@@ -12,7 +12,12 @@ if (fs.existsSync(backendEnvPath)) {
 const express = require('express');
 const { Configuration, PlaidApi, PlaidEnvironments } = require('plaid');
 const cors = require('cors');
-const { readCachedResponse, writeCachedResponse } = require('../shared/cache');
+const {
+  readCachedResponse,
+  writeCachedResponse,
+  getCacheBackendStatus,
+  probeFirestoreWrite
+} = require('../shared/cache');
 const movieCatalog = require('./movie-catalog');
 let nodemailer;
 try {
@@ -48,6 +53,28 @@ const OMDB_API_KEY =
   '';
 const OMDB_CACHE_COLLECTION = 'omdbRatings';
 const OMDB_CACHE_TTL_MS = 1000 * 60 * 60 * 12; // 12 hours
+const OMDB_PREFETCH_STATE_COLLECTION = 'omdbRatingsPrefetch';
+const OMDB_PREFETCH_STATE_KEY = ['state', 'v1'];
+const OMDB_PREFETCH_DEFAULT_DELAY_MS = Math.max(
+  600,
+  Number(process.env.OMDB_PREFETCH_DELAY_MS) || 1500
+);
+const OMDB_PREFETCH_DEFAULT_JITTER_MS = Math.max(
+  0,
+  Number(process.env.OMDB_PREFETCH_JITTER_MS) || 350
+);
+const OMDB_PREFETCH_DEFAULT_CHECKPOINT_EVERY = Math.max(
+  1,
+  Number(process.env.OMDB_PREFETCH_CHECKPOINT_EVERY) || 10
+);
+const OMDB_PREFETCH_DEFAULT_MAX_FETCHES_PER_RUN = Math.max(
+  0,
+  Number(process.env.OMDB_PREFETCH_MAX_FETCHES_PER_RUN) || 0
+);
+const OMDB_PREFETCH_DEFAULT_RETRY_AFTER_MS = Math.max(
+  5 * 60 * 1000,
+  Number(process.env.OMDB_PREFETCH_RETRY_AFTER_MS) || 60 * 60 * 1000
+);
 const YOUTUBE_SEARCH_BASE_URL = 'https://www.googleapis.com/youtube/v3/search';
 const YOUTUBE_API_KEY =
   process.env.YOUTUBE_API_KEY ||
@@ -60,6 +87,77 @@ const YOUTUBE_SEARCH_CACHE_TTL_MS = 1000 * 60 * 60 * 6; // 6 hours
 const DEFAULT_REMOTE_API_BASE = 'https://narrow-down.web.app/api';
 const DEFAULT_REMOTE_TMDB_PROXY_URL = `${DEFAULT_REMOTE_API_BASE}/tmdbProxy`;
 const TMDB_BASE_URL = 'https://api.themoviedb.org';
+const TMDB_IMAGE_BASE_URL = 'https://image.tmdb.org/t/p/';
+const TMDB_IMAGE_CACHE_COLLECTION = 'tmdbImageCache';
+const TMDB_IMAGE_CACHE_TTL_MS = Math.max(
+  24 * 60 * 60 * 1000,
+  Number(process.env.TMDB_IMAGE_CACHE_TTL_MS) || 30 * 24 * 60 * 60 * 1000
+);
+const TMDB_IMAGE_ALLOWED_SIZES = new Set([
+  'w92',
+  'w154',
+  'w185',
+  'w200',
+  'w300',
+  'w342',
+  'w400',
+  'w500',
+  'w780',
+  'original'
+]);
+const omdbPrefetchRuntime = {
+  running: false,
+  stopRequested: false,
+  startedAt: null,
+  lastFinishedAt: null,
+  options: null,
+  progress: null,
+  lastError: null
+};
+
+function buildRatingPrecisionDistribution(movies, precision, limit = 5) {
+  const normalizedPrecision = Number(precision);
+  if (!Number.isFinite(normalizedPrecision) || normalizedPrecision <= 0) {
+    return [];
+  }
+
+  const decimalPlaces = (() => {
+    const str = String(normalizedPrecision);
+    const dotIndex = str.indexOf('.');
+    if (dotIndex === -1) return 0;
+    return str.length - dotIndex - 1;
+  })();
+
+  const clamp = value => Math.min(10, Math.max(0, value));
+  const bucketCounts = new Map();
+
+  const safeFloor = value => {
+    return Math.floor((value + normalizedPrecision * 1e-8) / normalizedPrecision);
+  };
+
+  (Array.isArray(movies) ? movies : []).forEach(movie => {
+    const score = Number(movie?.score);
+    if (!Number.isFinite(score)) return;
+    const clamped = clamp(score);
+    const bucketIndex = safeFloor(clamped);
+    let bucketValue = bucketIndex * normalizedPrecision;
+    if (bucketValue > 10) bucketValue = 10;
+    const bucketKey = Number(bucketValue.toFixed(decimalPlaces));
+    bucketCounts.set(bucketKey, (bucketCounts.get(bucketKey) || 0) + 1);
+  });
+
+  if (!bucketCounts.size) return [];
+
+  const limited = Array.from(bucketCounts.entries())
+    .map(([value, count]) => ({ value, count }))
+    .sort((a, b) => b.value - a.value)
+    .slice(0, Math.max(1, Number(limit) || 1));
+
+  return limited.map(({ value, count }) => ({
+    label: value.toFixed(decimalPlaces),
+    count
+  }));
+}
 
 async function safeReadCachedResponse(collection, keyParts, ttlMs) {
   try {
@@ -305,6 +403,8 @@ async function requestTmdbData(endpointKey, query = {}) {
 app.use(cors());
 
 const CONTACT_EMAIL = Buffer.from('ZHZkbmRyc25AZ21haWwuY29t', 'base64').toString('utf8');
+const ADMIN_REFRESH_TOKEN =
+  process.env.ADMIN_REFRESH_TOKEN || process.env.MOVIE_CACHE_REFRESH_TOKEN || '';
 const mailer = (() => {
   if (!nodemailer || !process.env.SMTP_HOST || !process.env.SMTP_USER || !process.env.SMTP_PASS) return null;
   return nodemailer.createTransport({
@@ -363,6 +463,91 @@ async function handleTmdbProxyRequest(req, res) {
 app.get('/tmdbProxy', handleTmdbProxyRequest);
 app.get('/api/tmdbProxy', handleTmdbProxyRequest);
 
+app.get('/api/movie-image', async (req, res) => {
+  const imagePath = normalizeTmdbImagePath(req.query.path);
+  if (!imagePath) {
+    res.status(400).json({ error: 'invalid_image_path' });
+    return;
+  }
+
+  const size = normalizeTmdbImageSize(req.query.size);
+  const cacheKey = ['tmdb-image', size, imagePath];
+  const cached = await safeReadCachedResponse(
+    TMDB_IMAGE_CACHE_COLLECTION,
+    cacheKey,
+    TMDB_IMAGE_CACHE_TTL_MS
+  );
+  if (cached && typeof cached.body === 'string' && cached.body) {
+    const contentType =
+      typeof cached.contentType === 'string' && cached.contentType
+        ? cached.contentType
+        : 'image/jpeg';
+    try {
+      const decoded = Buffer.from(cached.body, 'base64');
+      if (decoded.length) {
+        res.set('Cache-Control', 'public, max-age=604800, stale-while-revalidate=86400');
+        res.type(contentType);
+        res.send(decoded);
+        return;
+      }
+    } catch (err) {
+      console.warn('Failed to decode cached movie image', err?.message || err);
+    }
+  }
+
+  const imageUrl = `${TMDB_IMAGE_BASE_URL}${size}${imagePath}`;
+  try {
+    const upstream = await fetch(imageUrl, {
+      headers: {
+        Accept: 'image/*',
+        'User-Agent': 'narrow-down-local-proxy'
+      }
+    });
+    if (!upstream.ok) {
+      res.status(upstream.status).json({ error: 'tmdb_image_fetch_failed' });
+      return;
+    }
+
+    const arrayBuffer = await upstream.arrayBuffer();
+    const imageBuffer = Buffer.from(arrayBuffer);
+    const contentType = upstream.headers.get('content-type') || 'image/jpeg';
+
+    if (imageBuffer.length) {
+      await safeWriteCachedResponse(TMDB_IMAGE_CACHE_COLLECTION, cacheKey, {
+        status: 200,
+        contentType,
+        body: imageBuffer.toString('base64'),
+        metadata: {
+          encoding: 'base64',
+          size,
+          path: imagePath,
+          source: imageUrl
+        }
+      });
+    }
+
+    res.set('Cache-Control', 'public, max-age=604800, stale-while-revalidate=86400');
+    res.type(contentType);
+    res.send(imageBuffer);
+  } catch (err) {
+    console.error('Failed to proxy movie image', err);
+    res.status(502).json({ error: 'movie_image_proxy_failed' });
+  }
+});
+
+app.get('/api/cache-status', async (req, res) => {
+  const status = getCacheBackendStatus();
+  let probe = null;
+  if (parseBooleanQuery(req.query.probe)) {
+    probe = await probeFirestoreWrite();
+  }
+  res.json({
+    cache: status,
+    probe,
+    timestamp: new Date().toISOString()
+  });
+});
+
 function sendCachedResponse(res, cached) {
   if (!cached || typeof cached.body !== 'string') return false;
   res.status(typeof cached.status === 'number' ? cached.status : 200);
@@ -385,6 +570,36 @@ function parseNumberQuery(value) {
   if (value === undefined || value === null || value === '') return null;
   const num = Number(value);
   return Number.isFinite(num) ? num : null;
+}
+
+function normalizeTmdbImagePath(value) {
+  if (typeof value !== 'string') return '';
+  const trimmed = value.trim();
+  if (!trimmed) return '';
+  const normalized = trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
+  if (normalized.includes('..')) return '';
+  if (!/^\/[A-Za-z0-9/_.-]+$/.test(normalized)) return '';
+  return normalized;
+}
+
+function normalizeTmdbImageSize(value) {
+  const fallback = 'w200';
+  if (typeof value !== 'string') return fallback;
+  const trimmed = value.trim();
+  if (!trimmed) return fallback;
+  if (TMDB_IMAGE_ALLOWED_SIZES.has(trimmed)) return trimmed;
+  return fallback;
+}
+
+function readAdminToken(req) {
+  const authHeader = req.get('authorization') || '';
+  if (authHeader.toLowerCase().startsWith('bearer ')) {
+    return authHeader.slice(7).trim();
+  }
+  const headerToken = req.get('x-admin-token');
+  if (headerToken) return String(headerToken).trim();
+  const queryToken = req.query.token;
+  return typeof queryToken === 'string' ? queryToken.trim() : '';
 }
 
 function normalizePositiveInteger(value, { min = 1, max = Number.MAX_SAFE_INTEGER } = {}) {
@@ -541,6 +756,417 @@ function normalizeOmdbPayload(data, { type, requestedTitle, requestedYear }) {
   };
 
   return payload;
+}
+
+function wait(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) {
+    return Promise.resolve();
+  }
+  return new Promise(resolve => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function normalizePrefetchState(raw) {
+  const base = {
+    cursor: 0,
+    completedPasses: 0,
+    totalMovies: 0,
+    processed: 0,
+    fetched: 0,
+    cacheHits: 0,
+    notFound: 0,
+    skipped: 0,
+    failed: 0,
+    rateLimited: 0,
+    haltedReason: null,
+    nextEligibleAt: null,
+    updatedAt: null
+  };
+  if (!raw || typeof raw !== 'object') {
+    return base;
+  }
+  const normalized = { ...base };
+  Object.keys(base).forEach(key => {
+    if (!(key in raw)) return;
+    if (key === 'haltedReason' || key === 'nextEligibleAt' || key === 'updatedAt') {
+      normalized[key] = raw[key] == null ? null : String(raw[key]);
+      return;
+    }
+    const value = Number(raw[key]);
+    normalized[key] = Number.isFinite(value) && value >= 0 ? Math.floor(value) : base[key];
+  });
+  return normalized;
+}
+
+async function loadOmdbPrefetchState() {
+  const cached = await safeReadCachedResponse(
+    OMDB_PREFETCH_STATE_COLLECTION,
+    OMDB_PREFETCH_STATE_KEY,
+    0
+  );
+  if (!cached || typeof cached.body !== 'string' || !cached.body.length) {
+    return normalizePrefetchState(null);
+  }
+  try {
+    return normalizePrefetchState(JSON.parse(cached.body));
+  } catch (err) {
+    console.warn('Failed to parse OMDb prefetch state cache', err?.message || err);
+    return normalizePrefetchState(null);
+  }
+}
+
+async function saveOmdbPrefetchState(state) {
+  const normalized = normalizePrefetchState(state);
+  await safeWriteCachedResponse(OMDB_PREFETCH_STATE_COLLECTION, OMDB_PREFETCH_STATE_KEY, {
+    body: JSON.stringify(normalized),
+    metadata: {
+      updatedAt: normalized.updatedAt || new Date().toISOString()
+    }
+  });
+}
+
+function getOmdbLookupFromMovie(movie) {
+  if (!movie || typeof movie !== 'object') return null;
+  const imdbId = sanitizeOmdbString(movie.imdbId || movie.imdb_id || movie.imdbID || '');
+  const title = sanitizeOmdbString(movie.title || movie.name || '');
+  const yearFromDate = extractYear(
+    sanitizeOmdbString(movie.releaseDate || movie.release_date || movie.first_air_date || '')
+  );
+  const year =
+    sanitizeOmdbString(String(yearFromDate || '')) ||
+    sanitizeOmdbString(String(movie.year || ''));
+  if (!imdbId && !title) return null;
+  return {
+    imdbId,
+    title,
+    year,
+    type: 'movie'
+  };
+}
+
+async function lookupAndCacheOmdbRatings({
+  imdbId,
+  title,
+  year,
+  type = 'movie',
+  forceRefresh = false,
+  apiKey
+}) {
+  const effectiveApiKey = sanitizeOmdbString(apiKey || OMDB_API_KEY);
+  if (!effectiveApiKey) {
+    return {
+      outcome: 'invalid_key',
+      message: 'OMDb API key is missing.',
+      madeNetworkRequest: false
+    };
+  }
+
+  const cacheParts = buildOmdbCacheKeyParts({
+    imdbId,
+    title,
+    year,
+    type: type || 'any'
+  });
+
+  if (!forceRefresh) {
+    const cached = await safeReadCachedResponse(
+      OMDB_CACHE_COLLECTION,
+      cacheParts,
+      OMDB_CACHE_TTL_MS
+    );
+    if (cached && typeof cached.body === 'string' && cached.body.length) {
+      return {
+        outcome: 'cache_hit',
+        cacheParts,
+        madeNetworkRequest: false
+      };
+    }
+  }
+
+  const params = new URLSearchParams();
+  params.set('apikey', effectiveApiKey);
+  if (imdbId) {
+    params.set('i', imdbId);
+  } else if (title) {
+    params.set('t', title);
+  }
+  if (year) params.set('y', year);
+  if (type) params.set('type', type);
+  params.set('plot', 'short');
+  params.set('r', 'json');
+
+  try {
+    const response = await fetch(`${OMDB_BASE_URL}?${params.toString()}`);
+    if (!response.ok) {
+      return {
+        outcome: 'request_failed',
+        status: response.status || 502,
+        message: `OMDb request failed with status ${response.status || 502}.`,
+        madeNetworkRequest: true
+      };
+    }
+
+    const data = await response.json();
+    if (!data || data.Response === 'False') {
+      const message = typeof data?.Error === 'string' ? data.Error : 'OMDb returned no results';
+      const normalized = message.toLowerCase();
+      if (normalized.includes('api key')) {
+        return {
+          outcome: 'invalid_key',
+          message,
+          madeNetworkRequest: true
+        };
+      }
+      if (
+        normalized.includes('limit') ||
+        normalized.includes('too many') ||
+        normalized.includes('request limit')
+      ) {
+        return {
+          outcome: 'rate_limited',
+          message,
+          madeNetworkRequest: true
+        };
+      }
+      return {
+        outcome: 'not_found',
+        message,
+        madeNetworkRequest: true
+      };
+    }
+
+    const payload = normalizeOmdbPayload(data, {
+      type: type || null,
+      requestedTitle: title,
+      requestedYear: year
+    });
+
+    if (!payload) {
+      return {
+        outcome: 'not_found',
+        message: 'OMDb did not return critic scores for this title.',
+        madeNetworkRequest: true
+      };
+    }
+
+    await safeWriteCachedResponse(OMDB_CACHE_COLLECTION, cacheParts, {
+      body: JSON.stringify(payload),
+      metadata: {
+        imdbId: payload.imdbId || imdbId || null,
+        title: payload.title || title || null,
+        year: payload.year || year || null,
+        type: payload.type || type || null
+      }
+    });
+
+    return {
+      outcome: 'fetched',
+      payload,
+      madeNetworkRequest: true
+    };
+  } catch (err) {
+    return {
+      outcome: 'request_failed',
+      message: String(err?.message || err),
+      madeNetworkRequest: true
+    };
+  }
+}
+
+async function getOmdbPrefetchStatus() {
+  const persisted = await loadOmdbPrefetchState();
+  return {
+    persisted,
+    runtime: {
+      running: Boolean(omdbPrefetchRuntime.running),
+      stopRequested: Boolean(omdbPrefetchRuntime.stopRequested),
+      startedAt: omdbPrefetchRuntime.startedAt,
+      lastFinishedAt: omdbPrefetchRuntime.lastFinishedAt,
+      options: omdbPrefetchRuntime.options,
+      progress: omdbPrefetchRuntime.progress,
+      lastError: omdbPrefetchRuntime.lastError
+    }
+  };
+}
+
+function scheduleOmdbPrefetch(options = {}) {
+  if (omdbPrefetchRuntime.running) {
+    return false;
+  }
+
+  omdbPrefetchRuntime.running = true;
+  omdbPrefetchRuntime.stopRequested = false;
+  omdbPrefetchRuntime.startedAt = new Date().toISOString();
+  omdbPrefetchRuntime.options = { ...options };
+  omdbPrefetchRuntime.progress = null;
+  omdbPrefetchRuntime.lastError = null;
+
+  (async () => {
+    const persisted = await loadOmdbPrefetchState();
+    const catalogState = await movieCatalog.ensureCatalog({
+      allowStale: true,
+      cacheOnly: true
+    });
+    const movies = Array.isArray(catalogState?.movies) ? catalogState.movies : [];
+    const totalMovies = movies.length;
+    const restarted = Boolean(options.restart);
+    let cursor = restarted
+      ? 0
+      : Math.max(0, Math.min(Number(persisted.cursor) || 0, totalMovies));
+    let completedPasses = Number(persisted.completedPasses) || 0;
+
+    const counters = {
+      processed: 0,
+      fetched: 0,
+      cacheHits: 0,
+      notFound: 0,
+      skipped: 0,
+      failed: 0,
+      rateLimited: 0,
+      networkRequests: 0
+    };
+
+    const checkpointEvery = Math.max(
+      1,
+      Number(options.checkpointEvery) || OMDB_PREFETCH_DEFAULT_CHECKPOINT_EVERY
+    );
+    const maxFetches = Math.max(
+      0,
+      Number(options.maxFetches) || OMDB_PREFETCH_DEFAULT_MAX_FETCHES_PER_RUN
+    );
+    const delayMs = Math.max(
+      600,
+      Number(options.delayMs) || OMDB_PREFETCH_DEFAULT_DELAY_MS
+    );
+    const jitterMs = Math.max(
+      0,
+      Number(options.jitterMs) || OMDB_PREFETCH_DEFAULT_JITTER_MS
+    );
+    const retryAfterMs = Math.max(
+      5 * 60 * 1000,
+      Number(options.retryAfterMs) || OMDB_PREFETCH_DEFAULT_RETRY_AFTER_MS
+    );
+    const forceRefresh = Boolean(options.forceRefresh);
+
+    let haltedReason = null;
+    let checkpointCounter = 0;
+
+    const persistProgress = async () => {
+      const nextState = {
+        cursor,
+        completedPasses,
+        totalMovies,
+        processed: counters.processed,
+        fetched: counters.fetched,
+        cacheHits: counters.cacheHits,
+        notFound: counters.notFound,
+        skipped: counters.skipped,
+        failed: counters.failed,
+        rateLimited: counters.rateLimited,
+        haltedReason,
+        nextEligibleAt:
+          haltedReason === 'rate_limited'
+            ? new Date(Date.now() + retryAfterMs).toISOString()
+            : null,
+        updatedAt: new Date().toISOString()
+      };
+      omdbPrefetchRuntime.progress = {
+        ...nextState,
+        networkRequests: counters.networkRequests
+      };
+      await saveOmdbPrefetchState(nextState);
+    };
+
+    if (!OMDB_API_KEY) {
+      haltedReason = 'missing_omdb_key';
+      await persistProgress();
+      return;
+    }
+
+    if (!totalMovies) {
+      haltedReason = 'empty_catalog';
+      await persistProgress();
+      return;
+    }
+
+    while (cursor < totalMovies) {
+      if (omdbPrefetchRuntime.stopRequested) {
+        haltedReason = 'stop_requested';
+        break;
+      }
+      if (maxFetches > 0 && counters.networkRequests >= maxFetches) {
+        haltedReason = 'max_fetches_reached';
+        break;
+      }
+
+      const movie = movies[cursor];
+      cursor += 1;
+      counters.processed += 1;
+      checkpointCounter += 1;
+
+      const lookup = getOmdbLookupFromMovie(movie);
+      if (!lookup) {
+        counters.skipped += 1;
+      } else {
+        const result = await lookupAndCacheOmdbRatings({
+          ...lookup,
+          apiKey: OMDB_API_KEY,
+          forceRefresh
+        });
+        if (result.madeNetworkRequest) {
+          counters.networkRequests += 1;
+        }
+        if (result.outcome === 'cache_hit') {
+          counters.cacheHits += 1;
+        } else if (result.outcome === 'fetched') {
+          counters.fetched += 1;
+        } else if (result.outcome === 'not_found') {
+          counters.notFound += 1;
+        } else if (result.outcome === 'rate_limited') {
+          counters.rateLimited += 1;
+          haltedReason = 'rate_limited';
+        } else if (result.outcome === 'invalid_key') {
+          haltedReason = 'invalid_omdb_key';
+        } else {
+          counters.failed += 1;
+        }
+
+        if (result.madeNetworkRequest && !haltedReason) {
+          const jitter = jitterMs > 0 ? Math.floor(Math.random() * (jitterMs + 1)) : 0;
+          await wait(delayMs + jitter);
+        }
+      }
+
+      if (haltedReason) {
+        break;
+      }
+
+      if (checkpointCounter >= checkpointEvery) {
+        checkpointCounter = 0;
+        await persistProgress();
+      }
+    }
+
+    if (!haltedReason && cursor >= totalMovies) {
+      haltedReason = 'completed_pass';
+      completedPasses += 1;
+      cursor = 0;
+    }
+
+    await persistProgress();
+  })()
+    .catch(err => {
+      omdbPrefetchRuntime.lastError = String(err?.message || err);
+      console.error('OMDb ratings prefetch failed', err);
+    })
+    .finally(() => {
+      omdbPrefetchRuntime.running = false;
+      omdbPrefetchRuntime.stopRequested = false;
+      omdbPrefetchRuntime.lastFinishedAt = new Date().toISOString();
+    });
+
+  return true;
 }
 
 const plaidClient = (() => {
@@ -934,23 +1560,49 @@ app.get('/api/movies', async (req, res) => {
     const limit = parseNumberQuery(req.query.limit) ?? DEFAULT_MOVIE_LIMIT;
     const freshLimit = parseNumberQuery(req.query.freshLimit);
     const minScore = parseNumberQuery(req.query.minScore);
-    const includeFresh = parseBooleanQuery(
-      req.query.includeFresh ?? req.query.fresh ?? req.query.includeNew
+    const excludeRaw = req.query.excludeIds;
+    const excludeSet = new Set();
+
+    const addExclusions = value => {
+      if (!value) return;
+      const parts = String(value)
+        .split(/[,|\s]+/)
+        .map(part => part.trim())
+        .filter(Boolean);
+      parts.forEach(part => excludeSet.add(part));
+    };
+
+    if (Array.isArray(excludeRaw)) {
+      excludeRaw.forEach(addExclusions);
+    } else if (typeof excludeRaw === 'string') {
+      addExclusions(excludeRaw);
+    }
+    const cacheOnly = parseBooleanQuery(
+      req.query.cacheOnly ?? req.query.cache ?? req.query.cache_only
     );
-    const freshOnly =
-      parseBooleanQuery(req.query.freshOnly ?? req.query.onlyFresh ?? req.query.newOnly) ||
-      (typeof req.query.scope === 'string' && req.query.scope.toLowerCase() === 'new');
+    const includeFresh = cacheOnly
+      ? false
+      : parseBooleanQuery(req.query.includeFresh ?? req.query.fresh ?? req.query.includeNew);
+    const freshOnly = cacheOnly
+      ? false
+      : parseBooleanQuery(req.query.freshOnly ?? req.query.onlyFresh ?? req.query.newOnly) ||
+        (typeof req.query.scope === 'string' && req.query.scope.toLowerCase() === 'new');
     const forceRefresh = parseBooleanQuery(req.query.refresh);
 
     const curatedLimit = Math.max(1, Number(limit) || 20);
     const fallbackFreshLimit = Math.max(1, Math.min(curatedLimit, 10));
     const effectiveFreshLimit = Math.max(1, Number(freshLimit) || fallbackFreshLimit);
 
-    const catalogState = await movieCatalog.ensureCatalog({ forceRefresh });
+    const catalogState = await movieCatalog.ensureCatalog({
+      forceRefresh: cacheOnly ? false : forceRefresh,
+      allowStale: true,
+      cacheOnly
+    });
     const hasCredentials = movieCatalog.hasTmdbCredentials();
     const curatedSearch = movieCatalog.searchCatalogWithStats(query, {
       limit: curatedLimit,
-      minScore: minScore == null ? undefined : minScore
+      minScore: minScore == null ? undefined : minScore,
+      excludeIds: excludeSet
     });
     const curatedResults = freshOnly ? [] : curatedSearch.results;
     const curatedTotalMatches = Math.max(
@@ -970,17 +1622,22 @@ app.get('/api/movies', async (req, res) => {
     let freshResults = [];
     let freshError = null;
     const shouldFetchFresh =
-      freshOnly ||
-      includeFresh ||
-      (!curatedResults.length && Boolean(query));
+      !cacheOnly &&
+      (freshOnly ||
+        includeFresh ||
+        (!curatedResults.length && Boolean(query)));
 
     if (shouldFetchFresh) {
       if (hasCredentials) {
         try {
+          const freshExcludeIds = curatedResults.map(movie => movie.id);
+          if (excludeSet.size) {
+            freshExcludeIds.push(...excludeSet);
+          }
           freshResults = await movieCatalog.fetchNewReleases({
             query,
             limit: freshOnly ? curatedLimit : effectiveFreshLimit,
-            excludeIds: curatedResults.map(movie => movie.id)
+            excludeIds: freshExcludeIds
           });
         } catch (err) {
           console.error('Failed to fetch new release movies', err);
@@ -1010,6 +1667,7 @@ app.get('/api/movies', async (req, res) => {
         minScore: minScore == null ? movieCatalog.MIN_SCORE : minScore,
         includeFresh: Boolean(shouldFetchFresh && hasCredentials),
         freshOnly: Boolean(freshOnly),
+        cacheOnly: Boolean(cacheOnly),
         curatedLimit,
         source: catalogState?.metadata?.source || null,
         freshRequested: Boolean(shouldFetchFresh)
@@ -1032,9 +1690,136 @@ app.get('/api/movies', async (req, res) => {
   }
 });
 
+app.post('/api/admin/refresh-movie-cache', async (req, res) => {
+  if (!ADMIN_REFRESH_TOKEN) {
+    return res.status(503).json({ error: 'admin_refresh_unconfigured' });
+  }
+  const token = readAdminToken(req);
+  if (!token || token !== ADMIN_REFRESH_TOKEN) {
+    return res.status(401).json({ error: 'admin_refresh_unauthorized' });
+  }
+  const startedAt = Date.now();
+  try {
+    const catalogState = await movieCatalog.ensureCatalog({
+      forceRefresh: true,
+      allowStale: false,
+      cacheOnly: false,
+      bypassRangeCache: true
+    });
+    const total = Array.isArray(catalogState?.movies) ? catalogState.movies.length : 0;
+    res.json({
+      ok: true,
+      refreshedAt: new Date().toISOString(),
+      durationMs: Date.now() - startedAt,
+      catalogTotal: total,
+      catalogUpdatedAt:
+        catalogState?.metadata?.updatedAt ||
+        (catalogState?.updatedAt
+          ? new Date(catalogState.updatedAt).toISOString()
+          : null),
+      source: catalogState?.metadata?.source || null
+    });
+  } catch (err) {
+    console.error('Admin movie cache refresh failed', err);
+    res.status(500).json({ error: 'admin_refresh_failed' });
+  }
+});
+
+app.get('/api/admin/prefetch-movie-ratings', async (req, res) => {
+  if (!ADMIN_REFRESH_TOKEN) {
+    return res.status(503).json({ error: 'admin_refresh_unconfigured' });
+  }
+  const token = readAdminToken(req);
+  if (!token || token !== ADMIN_REFRESH_TOKEN) {
+    return res.status(401).json({ error: 'admin_refresh_unauthorized' });
+  }
+
+  const status = await getOmdbPrefetchStatus();
+  res.json({
+    ok: true,
+    ...status
+  });
+});
+
+app.post('/api/admin/prefetch-movie-ratings', async (req, res) => {
+  if (!ADMIN_REFRESH_TOKEN) {
+    return res.status(503).json({ error: 'admin_refresh_unconfigured' });
+  }
+  const token = readAdminToken(req);
+  if (!token || token !== ADMIN_REFRESH_TOKEN) {
+    return res.status(401).json({ error: 'admin_refresh_unauthorized' });
+  }
+
+  const payload = req.body && typeof req.body === 'object' ? req.body : {};
+  const stop = parseBooleanQuery(payload.stop ?? req.query.stop);
+  if (stop) {
+    if (omdbPrefetchRuntime.running) {
+      omdbPrefetchRuntime.stopRequested = true;
+    }
+    const status = await getOmdbPrefetchStatus();
+    return res.json({
+      ok: true,
+      started: false,
+      stopping: Boolean(omdbPrefetchRuntime.running),
+      ...status
+    });
+  }
+
+  if (omdbPrefetchRuntime.running) {
+    const status = await getOmdbPrefetchStatus();
+    return res.status(409).json({
+      error: 'omdb_prefetch_in_progress',
+      ...status
+    });
+  }
+
+  const parsedJitter = parseNumberQuery(payload.jitterMs ?? req.query.jitterMs);
+  const parsedMaxFetches = parseNumberQuery(payload.maxFetches ?? req.query.maxFetches);
+
+  const options = {
+    restart: parseBooleanQuery(payload.restart ?? req.query.restart),
+    forceRefresh: parseBooleanQuery(payload.forceRefresh ?? req.query.forceRefresh),
+    delayMs:
+      normalizePositiveInteger(payload.delayMs ?? req.query.delayMs, { min: 600, max: 60000 }) ||
+      OMDB_PREFETCH_DEFAULT_DELAY_MS,
+    jitterMs:
+      parsedJitter == null
+        ? OMDB_PREFETCH_DEFAULT_JITTER_MS
+        : Math.max(0, Math.min(10000, Math.round(parsedJitter))),
+    checkpointEvery:
+      normalizePositiveInteger(
+        payload.checkpointEvery ?? req.query.checkpointEvery,
+        { min: 1, max: 500 }
+      ) || OMDB_PREFETCH_DEFAULT_CHECKPOINT_EVERY,
+    maxFetches:
+      parsedMaxFetches == null
+        ? OMDB_PREFETCH_DEFAULT_MAX_FETCHES_PER_RUN
+        : Math.max(0, Math.min(100000, Math.round(parsedMaxFetches))),
+    retryAfterMs:
+      normalizePositiveInteger(payload.retryAfterMs ?? req.query.retryAfterMs, {
+        min: 5 * 60 * 1000,
+        max: 24 * 60 * 60 * 1000
+      }) || OMDB_PREFETCH_DEFAULT_RETRY_AFTER_MS
+  };
+
+  const started = scheduleOmdbPrefetch(options);
+  const status = await getOmdbPrefetchStatus();
+  return res.status(started ? 202 : 409).json({
+    ok: started,
+    started,
+    ...status
+  });
+});
+
 app.get('/api/movies/stats', async (req, res) => {
   try {
-    const catalogState = await movieCatalog.ensureCatalog();
+    const cacheOnly = parseBooleanQuery(
+      req.query.cacheOnly ?? req.query.cache ?? req.query.cache_only
+    );
+    const catalogState = await movieCatalog.ensureCatalog({
+      allowStale: true,
+      cacheOnly
+    });
     const movies = Array.isArray(catalogState?.movies) ? catalogState.movies : [];
     const excludeRaw = req.query.excludeIds;
     const excludeSet = new Set();
@@ -1079,6 +1864,16 @@ app.get('/api/movies/stats', async (req, res) => {
       }
     });
 
+    const ratingPrecision =
+      parseNumberQuery(req.query.ratingPrecision ?? req.query.precision) ?? null;
+    const ratingTop =
+      parseNumberQuery(req.query.ratingTop ?? req.query.top) ?? 5;
+
+    const ratingDistribution =
+      ratingPrecision && ratingTop
+        ? buildRatingPrecisionDistribution(movies, ratingPrecision, ratingTop)
+        : [];
+
     res.json({
       total,
       catalogTotal: movies.length,
@@ -1087,7 +1882,8 @@ app.get('/api/movies/stats', async (req, res) => {
         (catalogState?.updatedAt
           ? new Date(catalogState.updatedAt).toISOString()
           : null),
-      buckets: bucketStats.map(({ label, count }) => ({ label, count }))
+      buckets: bucketStats.map(({ label, count }) => ({ label, count })),
+      ratingDistribution
     });
   } catch (err) {
     console.error('Failed to compute movie stats', err);

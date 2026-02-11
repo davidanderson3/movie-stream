@@ -1,16 +1,7 @@
 import { loadDecisions, flushPendingDecisions, clearDecisionsCache, pickDate } from './helpers.js';
-import { renderDailyTasks } from './daily.js';
-import { renderGoalsAndSubitems, addCalendarGoal } from './goals.js';
 import { initAuth, db, currentUser } from './auth.js';
-import { initWizard } from './wizard.js';
-import { renderDailyTaskReport } from './report.js';
-import { initMetricsUI } from './stats.js';
-import { initTabs } from './tabs.js';
 import { initButtonStyles } from './buttonStyles.js';
-import { initTabReports } from './tabReports.js';
 import { loadHiddenTabs, applyHiddenTabs, saveHiddenTabs } from './settings.js';
-import { applySiteName } from './siteName.js';
-import { initDescriptions } from './descriptions.js';
 
 let hiddenTabsTimer = null;
 let renderQueue = Promise.resolve();
@@ -54,8 +45,6 @@ window.addEventListener('DOMContentLoaded', () => {
         console.warn('Service worker registration failed:', err);
       });
   }
-    applySiteName();
-    initDescriptions();
   const uiRefs = {
     loginBtn: document.getElementById('loginBtn'),
     logoutBtn: document.getElementById('logoutBtn'),
@@ -82,6 +71,40 @@ window.addEventListener('DOMContentLoaded', () => {
   };
 
   const goalsView = document.getElementById('goalsView');
+  const moviesPanel = document.getElementById('moviesPanel');
+  let lastAuthMoviesUserId = currentUser?.uid || null;
+
+  let moviesPanelInitialized = false;
+  let moviesPanelInitPromise = null;
+  let hasHandledInitialMoviesAuthState = false;
+  async function ensureMoviesPanelInitialized() {
+    if (moviesPanelInitialized) return;
+    if (moviesPanelInitPromise) {
+      await moviesPanelInitPromise;
+      return;
+    }
+    moviesPanelInitPromise = (async () => {
+      try {
+        const initializer =
+          (typeof window !== 'undefined' && window.initMoviesPanel) ||
+          (await import('./movies.js')).initMoviesPanel;
+        if (typeof initializer === 'function') {
+          await initializer();
+        }
+        moviesPanelInitialized = true;
+      } catch (err) {
+        console.error('Failed to initialize movies panel', err);
+      } finally {
+        moviesPanelInitPromise = null;
+      }
+    })();
+    await moviesPanelInitPromise;
+  }
+
+  if (moviesPanel) {
+    moviesPanel.style.display = 'flex';
+    ensureMoviesPanelInitialized();
+  }
 
   uiRefs.signupBtn?.addEventListener('click', () => uiRefs.loginBtn?.click());
   uiRefs.calendarAddProjectBtn?.addEventListener('click', () => addCalendarGoal());
@@ -185,55 +208,7 @@ window.addEventListener('DOMContentLoaded', () => {
   function handleBottomAdd() {
     const active = document.querySelector('.tab-button.active')?.dataset.target;
     if (!active) return;
-    if (active === 'projectsPanel') {
-      uiRefs.addProjectBtn?.click();
-      return;
-    }
-    if (active === 'calendarPanel') {
-      addCalendarGoal();
-      return;
-    }
-    if (active === 'dailyPanel') {
-      showAddModal({
-        title: 'Add Task',
-        options: [
-          { label: 'Daily', value: 'daily' },
-          { label: 'Weekly', value: 'weekly' },
-          { label: 'Monthly', value: 'monthly' }
-        ],
-        sectionOptions: [
-          { label: 'First Thing', value: 'firstThing' },
-          { label: 'Morning', value: 'morning' },
-          { label: 'Afternoon', value: 'afternoon' },
-          { label: 'Evening', value: 'evening' },
-          { label: 'End of Day', value: 'endOfDay' }
-        ],
-        showTextInput: true,
-        onSubmit({ option, text, section }) {
-          if (option && text) {
-            if (option === 'daily') window.quickAddTask?.(option, text, section);
-            else window.quickAddTask?.(option, text);
-          }
-        }
-      });
-      return;
-    }
-    if (active === 'metricsPanel') {
-      window.openMetricsConfigForm?.();
-      return;
-    }
-    if (active === 'listsPanel') {
-      window.openListsFormModal?.();
-      return;
-    }
-    if (active === 'travelPanel') {
-      document.getElementById('addPlaceBtn')?.click();
-      return;
-    }
-    if (active === 'budgetPanel') {
-      window.openBudgetItemForm?.();
-      return;
-    }
+    // All panels except movie stream related are removed.
   }
 
   function setupHideTabButton(btn) {
@@ -334,49 +309,9 @@ window.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  function initCalendarMobileTabs() {
-    const panel = document.getElementById('calendarPanel');
-    const dailyBtn = document.getElementById('calendarDailyTab');
-    const hourlyBtn = document.getElementById('calendarHourlyTab');
-    const tabs = document.querySelector('.calendar-mobile-tabs');
-    if (!panel || !dailyBtn || !hourlyBtn || !tabs) return;
 
-    const setView = view => {
-      panel.classList.toggle('mobile-daily', view === 'daily');
-      panel.classList.toggle('mobile-hourly', view === 'hourly');
-      dailyBtn.classList.toggle('active', view === 'daily');
-      hourlyBtn.classList.toggle('active', view === 'hourly');
-    };
 
-    dailyBtn.addEventListener('click', () => setView('daily'));
-    hourlyBtn.addEventListener('click', () => setView('hourly'));
 
-    const mq = window.matchMedia('(max-width: 768px)');
-    const updateVisibility = () => {
-      const isMobile = mq.matches;
-      tabs.style.display = isMobile ? '' : 'none';
-      if (isMobile) {
-        setView('daily');
-      } else {
-        panel.classList.remove('mobile-daily', 'mobile-hourly');
-        dailyBtn.classList.remove('active');
-        hourlyBtn.classList.remove('active');
-      }
-    };
-    updateVisibility();
-    if (mq.addEventListener) {
-      mq.addEventListener('change', updateVisibility);
-    } else if (mq.addListener) {
-      mq.addListener(updateVisibility);
-    }
-  }
-
-  function clearTaskLists() {
-    ['goalList', 'completedList', 'dailyTasksList', 'weeklyTasksList', 'monthlyTasksList'].forEach(id => {
-      const el = document.getElementById(id);
-      if (el) el.innerHTML = '';
-    });
-  }
 
   const SIGNED_OUT_TABS = ['moviesPanel'];
 
@@ -401,43 +336,39 @@ window.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-  // Clear any stale content immediately to avoid flashing old tasks on mobile
-  clearTaskLists();
+
 
   // Re-render UI components whenever decisions are updated
   window.addEventListener('decisionsUpdated', () => {
-    if (document.getElementById('goalList')) {
-      renderQueue = renderQueue.then(() => renderGoalsAndSubitems());
-    }
-    if (
-      document.getElementById('dailyPanel') &&
-      document.querySelector('.tab-button.active')?.dataset.target === 'dailyPanel'
-    ) {
-      renderDailyTasks(currentUser, db);
-    }
-    initTabReports(currentUser, db);
-    if (document.getElementById('reportBody')) {
-      renderDailyTaskReport(currentUser, db);
-    }
+    // All components related to daily tasks, goals, and reports have been removed.
   });
 
     initAuth(uiRefs, async (user) => {
-
-      clearTaskLists();
-      clearDecisionsCache();
-
-      window.openGoalIds?.clear?.();
+      const nextMoviesUserId = user?.uid || null;
+      if (moviesPanel && !hasHandledInitialMoviesAuthState) {
+        hasHandledInitialMoviesAuthState = true;
+        lastAuthMoviesUserId = nextMoviesUserId;
+        await ensureMoviesPanelInitialized();
+      } else if (nextMoviesUserId !== lastAuthMoviesUserId) {
+        try {
+          const moviesModule = await import('./movies.js');
+          if (typeof moviesModule.refreshMoviesPanelForAuthChange === 'function') {
+            await moviesModule.refreshMoviesPanelForAuthChange(user || null);
+          } else if (typeof window !== 'undefined' && typeof window.initMoviesPanel === 'function') {
+            await window.initMoviesPanel();
+          }
+        } catch (err) {
+          console.warn('Failed to refresh movies after auth change', err);
+        }
+        lastAuthMoviesUserId = nextMoviesUserId;
+      }
 
       if (!user) {
         if (goalsView) goalsView.style.display = '';
-        await initTabs(null, db);
+        // All components related to daily tasks, goals, and reports have been removed.
         const hidden = await loadHiddenTabs();
         applyHiddenTabs(hidden);
         showOnlySignedOutTabs();
-        // Render sample routine tasks for visitors
-        if (document.getElementById('dailyPanel')) {
-          await renderDailyTasks(null, db);
-        }
         if (hiddenTabsTimer) clearInterval(hiddenTabsTimer);
         hiddenTabsTimer = setInterval(async () => {
           const h = await loadHiddenTabs();
@@ -446,22 +377,12 @@ window.addEventListener('DOMContentLoaded', () => {
         }, 60 * 1000);
         const tabsEl = document.getElementById('tabsContainer');
         if (tabsEl) tabsEl.style.visibility = 'visible';
-        if (document.getElementById('goalList')) {
-          renderGoalsAndSubitems();
-        }
-        if (
-          document.getElementById('dailyPanel') &&
-          document.querySelector('.tab-button.active')?.dataset.target === 'dailyPanel'
-        ) {
-          renderDailyTasks(null, db);
-        }
-        initTabReports(null, db);
         return;
       }
 
       if (goalsView) goalsView.style.display = '';
 
-      await initTabs(user, db);
+      // await initTabs(user, db); // Removed as tabs module was deleted
       const hidden = await loadHiddenTabs();
       applyHiddenTabs(hidden);
       if (hiddenTabsTimer) clearInterval(hiddenTabsTimer);
@@ -472,27 +393,7 @@ window.addEventListener('DOMContentLoaded', () => {
       await loadDecisions(true);
       const tabsEl = document.getElementById('tabsContainer');
       if (tabsEl) tabsEl.style.visibility = 'visible';
-      if (window.initTravelPanel) {
-        try {
-          await window.initTravelPanel();
-        } catch (err) {
-          console.error('Failed to initialize travel panel after sign-in', err);
-        }
-      }
-      if (window.initWeatherPanel) {
-        try {
-          await window.initWeatherPanel();
-        } catch (err) {
-          console.error('Failed to initialize weather panel after sign-in', err);
-        }
-      }
-      if (window.initPlanningPanel) {
-        try {
-          await window.initPlanningPanel();
-        } catch (err) {
-          console.error('Failed to initialize planning panel after sign-in', err);
-        }
-      }
+      // Removed calls to initTravelPanel, initWeatherPanel, initPlanningPanel as their modules were deleted.
 
       const backupData = await loadDecisions();
       const backupKey = `backup-${new Date().toISOString().slice(0, 10)}`;
@@ -500,10 +401,10 @@ window.addEventListener('DOMContentLoaded', () => {
     });
 
   if (uiRefs.wizardContainer && uiRefs.wizardStep) {
-    initWizard(uiRefs);
+    // initWizard(uiRefs); // Removed as wizard.js was deleted
   }
 
-  initCalendarMobileTabs();
+  // initCalendarMobileTabs(); // Removed as calendar related modules were deleted
   initButtonStyles();
 
   // Persist any unsaved decisions when the page is hidden or closed
@@ -520,6 +421,3 @@ window.addEventListener('DOMContentLoaded', () => {
     }
   });
 });
-
-window.renderDailyTasks = renderDailyTasks;
-window.initMetricsUI = initMetricsUI;

@@ -14,9 +14,32 @@ const PREF_COLLECTION = 'moviePreferences';
 const MIN_VOTE_AVERAGE = 7;
 const MIN_VOTE_COUNT = 50;
 const MIN_PRIORITY_RESULTS = 12;
-const MIN_FEED_RESULTS = 10;
+const CACHE_QUERY_LIMIT_ALL = 20000;
+const NEW_MOVIE_FETCH_LIMIT = 80;
 const GENRE_SELECTION_ALL = '__all__';
 const GENRE_SELECTION_NONE = '__none__';
+const GENRE_MAP_STORAGE_KEY = 'movieGenreMap';
+const FALLBACK_GENRE_MAP = Object.freeze({
+  28: 'Action',
+  12: 'Adventure',
+  16: 'Animation',
+  35: 'Comedy',
+  80: 'Crime',
+  99: 'Documentary',
+  18: 'Drama',
+  10751: 'Family',
+  14: 'Fantasy',
+  36: 'History',
+  27: 'Horror',
+  10402: 'Music',
+  9648: 'Mystery',
+  10749: 'Romance',
+  878: 'Science Fiction',
+  10770: 'TV Movie',
+  53: 'Thriller',
+  10752: 'War',
+  37: 'Western'
+});
 const MOVIE_RATING_BUCKETS = [
   { label: '9-10', min: 9, max: Infinity },
   { label: '8-8.9', min: 8, max: 9 },
@@ -34,6 +57,8 @@ const unsupportedProxyEndpoints = new Set();
 let loggedProxyCreditsUnsupported = false;
 
 const SUPPRESSED_STATUSES = new Set(['watched', 'notInterested', 'interested']);
+const RATING_DISTRIBUTION_PRECISION = 0.1;
+const RATING_DISTRIBUTION_LIMIT = 5;
 
 const FEED_FILTERS_KEY = 'movieFeedFilters';
 const DEFAULT_FEED_FILTER_STATE = Object.freeze({
@@ -45,6 +70,10 @@ const DEFAULT_FEED_FILTER_STATE = Object.freeze({
 });
 
 let feedFilterState = { ...DEFAULT_FEED_FILTER_STATE };
+
+let ratingDistributionVisible = false;
+let ratingDistributionData = null;
+let pendingRatingDistributionPromise = null;
 
 function getDocument() {
   return typeof document !== 'undefined' ? document : null;
@@ -64,8 +93,10 @@ const domRefs = {
   interestedList: null,
   interestedFilters: null,
   watchedList: null,
+  findNewButton: null,
   apiKeyInput: null,
   apiKeyContainer: null,
+  apiKeyStatus: null,
   tabs: null,
   streamSection: null,
   interestedSection: null,
@@ -73,6 +104,11 @@ const domRefs = {
   watchedSort: null,
   feedControls: null,
   feedStatus: null,
+  feedStatusBottom: null,
+  unclassifiedCount: null,
+  ratingDistributionToggle: null,
+  ratingDistributionPanel: null,
+  ratingDistributionList: null,
   feedMinRating: null,
   feedMinVotes: null,
   feedStartYear: null,
@@ -92,15 +128,15 @@ let prefsLoadedFor = null;
 let loadingPrefsPromise = null;
 let activeUserId = null;
 const activeInterestedGenres = new Set();
-let refillInProgress = false;
-let lastRefillAttempt = 0;
-let pendingRefillCooldownTimer = null;
-let feedExhausted = false;
+let lastRenderedFilterSignature = '';
+let lastRenderedMovieIds = [];
 let watchedSortMode = 'recent';
 let activeInterestedGenre = null;
+let findNewInProgress = false;
 const handlers = {
   handleKeydown: null,
-  handleChange: null
+  handleChange: null,
+  handleFindNewClick: null
 };
 
 const criticScoreStateById = new Map();
@@ -113,6 +149,8 @@ const STATUS_TONE_CLASSES = Object.freeze({
   warning: 'movie-status--warning',
   error: 'movie-status--error'
 });
+const STATUS_MIN_READABLE_MS = 1500;
+const statusUiStateByElement = new WeakMap();
 
 function escapeForAttribute(value) {
   return String(value)
@@ -123,7 +161,38 @@ function escapeForAttribute(value) {
     .replace(/'/g, '&#39;');
 }
 
-let loadAttemptCounter = 0;
+function getStatusUiState(statusEl) {
+  if (!statusEl) return null;
+  let state = statusUiStateByElement.get(statusEl);
+  if (!state) {
+    state = {
+      loadingSince: 0,
+      pendingClearTimer: null,
+      lastWasLoading: false
+    };
+    statusUiStateByElement.set(statusEl, state);
+  }
+  return state;
+}
+
+function buildRottenTomatoesSearchUrl(title) {
+  const trimmed = String(title || '').trim();
+  if (!trimmed) return '';
+  return `https://www.rottentomatoes.com/search?search=${encodeURIComponent(trimmed)}`;
+}
+
+function createRottenTomatoesLink(title) {
+  const url = buildRottenTomatoesSearchUrl(title);
+  if (!url) return null;
+  const link = document.createElement('a');
+  link.className = 'movie-rt-link';
+  link.href = url;
+  link.target = '_blank';
+  link.rel = 'noopener noreferrer';
+  link.textContent = 'Rotten Tomatoes';
+  link.setAttribute('aria-label', `Search Rotten Tomatoes for ${title}`);
+  return link;
+}
 
 function buildMoviesApiUrl(path = '/api/movies') {
   const trimmedPath = path.startsWith('/') ? path : `/${path}`;
@@ -542,21 +611,63 @@ function appendCriticScoresMeta(metaList, movie) {
   metaList.appendChild(item);
 }
 
-function updateFeedStatus(message, { tone = 'info', showSpinner = false } = {}) {
-  const statusEl = domRefs.feedStatus;
-  if (!statusEl) return;
+function updateFeedStatus(
+  message,
+  { tone = 'info', showSpinner = false, location = 'top', force = false } = {}
+) {
   const normalizedMessage = typeof message === 'string' ? message : String(message ?? '');
   const isCooldownMessage = /before requesting more movies/i.test(normalizedMessage);
+  const isLoadingVisual = Boolean(showSpinner || isCooldownMessage);
+  const isClearMessage = !normalizedMessage.trim() && !isLoadingVisual;
+  const preferredEl =
+    location === 'bottom'
+      ? domRefs.feedStatusBottom
+      : domRefs.feedStatus;
+  const fallbackEl =
+    location === 'bottom'
+      ? domRefs.feedStatus
+      : domRefs.feedStatusBottom;
+
+  if (location === 'bottom' && !preferredEl && isClearMessage) {
+    return;
+  }
+
+  const statusEl = preferredEl || fallbackEl;
+  if (!statusEl) return;
+
+  const state = getStatusUiState(statusEl);
+  if (!force && isClearMessage && state?.lastWasLoading && state.loadingSince) {
+    const elapsed = Date.now() - state.loadingSince;
+    if (elapsed < STATUS_MIN_READABLE_MS) {
+      const waitMs = STATUS_MIN_READABLE_MS - elapsed;
+      if (state.pendingClearTimer) {
+        clearTimeout(state.pendingClearTimer);
+      }
+      state.pendingClearTimer = setTimeout(() => {
+        state.pendingClearTimer = null;
+        updateFeedStatus('', { tone, showSpinner: false, location, force: true });
+      }, waitMs);
+      return;
+    }
+  }
+
+  if (state?.pendingClearTimer) {
+    clearTimeout(state.pendingClearTimer);
+    state.pendingClearTimer = null;
+  }
+
   if (isCooldownMessage) {
     const fallbackLabel = normalizedMessage.trim()
       ? normalizedMessage.trim()
       : 'Preparing more movies shortly';
     const ariaLabel = escapeForAttribute(fallbackLabel);
+    const safeLabel = escapeForAttribute(fallbackLabel);
     statusEl.innerHTML = `
       <div class="movie-status__cooldown" role="status" aria-live="polite"${
         ariaLabel ? ` aria-label="${ariaLabel}"` : ''
       }>
         <span class="movie-status__sr">${ariaLabel || 'Preparing more movies shortly'}</span>
+        <span class="movie-status__cooldown-label">${safeLabel}</span>
         <div class="movie-status__projector">
           <div class="movie-status__reel"></div>
           <div class="movie-status__filmstrip">
@@ -579,15 +690,19 @@ function updateFeedStatus(message, { tone = 'info', showSpinner = false } = {}) 
       console.info(normalizedMessage);
     }
   } else if (showSpinner) {
-    const ariaLabel = normalizedMessage.trim() ? escapeForAttribute(normalizedMessage) : '';
+    const helperText = normalizedMessage.trim() || 'Loading more movies...';
+    const safeHelperText = escapeForAttribute(helperText);
     statusEl.innerHTML = `
       <div class="movie-status__loader" role="status" aria-live="polite"${
-        ariaLabel ? ` aria-label="${ariaLabel}"` : ''
+        safeHelperText ? ` aria-label="${safeHelperText}"` : ''
       }>
-        <span class="movie-status__sr">${ariaLabel}</span>
-        <span class="movie-status__dot"></span>
-        <span class="movie-status__dot"></span>
-        <span class="movie-status__dot"></span>
+        <span class="movie-status__sr">${safeHelperText || 'Loading more movies...'}</span>
+        <span class="movie-status__loader-label">${safeHelperText}</span>
+        <div class="movie-status__loader-dots">
+          <span class="movie-status__dot"></span>
+          <span class="movie-status__dot"></span>
+          <span class="movie-status__dot"></span>
+        </div>
       </div>
     `;
     statusEl.setAttribute('aria-busy', 'true');
@@ -603,7 +718,17 @@ function updateFeedStatus(message, { tone = 'info', showSpinner = false } = {}) 
   });
   const toneClass = STATUS_TONE_CLASSES[tone] || STATUS_TONE_CLASSES.info;
   statusEl.classList.add(toneClass);
-  statusEl.classList.toggle('movie-status--loading', Boolean(showSpinner || isCooldownMessage));
+  statusEl.classList.toggle('movie-status--loading', isLoadingVisual);
+
+  if (state) {
+    if (isLoadingVisual) {
+      state.loadingSince = Date.now();
+      state.lastWasLoading = true;
+    } else if (normalizedMessage.trim()) {
+      state.lastWasLoading = false;
+      state.loadingSince = 0;
+    }
+  }
 }
 
 function clampUserRating(value) {
@@ -612,7 +737,6 @@ function clampUserRating(value) {
   if (value > 10) return 10;
   return Math.round(value * 2) / 2;
 }
-const REFILL_COOLDOWN_MS = 5000;
 
 function getNameList(input) {
   if (!input) return [];
@@ -643,8 +767,8 @@ function getNameList(input) {
 
 function meetsQualityThreshold(movie, minAverage = MIN_VOTE_AVERAGE, minVotes = MIN_VOTE_COUNT) {
   if (!movie || typeof movie !== 'object') return false;
-  const average = Number(movie.vote_average ?? 0);
-  const votes = Number(movie.vote_count ?? 0);
+  const average = Number(movie.vote_average ?? movie.score ?? 0);
+  const votes = Number(movie.vote_count ?? movie.voteCount ?? 0);
   if (!Number.isFinite(average) || !Number.isFinite(votes)) return false;
   return average >= minAverage && votes >= minVotes;
 }
@@ -695,6 +819,29 @@ function saveLocalDiscoverState(state) {
       return;
     }
     localStorage.setItem(TMDB_DISCOVER_STATE_STORAGE_KEY, JSON.stringify(state));
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+function loadCachedGenreMap() {
+  if (typeof localStorage === 'undefined') return null;
+  try {
+    const raw = localStorage.getItem(GENRE_MAP_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    return normalizeGenreMap(parsed);
+  } catch (_) {
+    return null;
+  }
+}
+
+function storeCachedGenreMap(raw) {
+  const normalized = normalizeGenreMap(raw);
+  if (!normalized || !Object.keys(normalized).length) return;
+  if (typeof localStorage === 'undefined') return;
+  try {
+    localStorage.setItem(GENRE_MAP_STORAGE_KEY, JSON.stringify(normalized));
   } catch (_) {
     /* ignore */
   }
@@ -844,13 +991,10 @@ function isGenreSelected(id) {
 
 function getDisallowedGenreIdSet() {
   const mode = getGenreSelectionMode();
-  if (mode === 'all') {
+  if (mode === 'all' || mode === 'none') {
     return new Set();
   }
   const available = getAvailableGenreIds();
-  if (mode === 'none') {
-    return new Set(available);
-  }
   const selected = getSelectedGenreIdSet();
   const disallowed = new Set();
   available.forEach(id => {
@@ -938,17 +1082,31 @@ function getGenreSelectionSummaryText() {
   return `${names.length} genres selected`;
 }
 
+function getFeedFilterSignature() {
+  const normalized = [
+    feedFilterState.minRating ?? '',
+    feedFilterState.minVotes ?? '',
+    feedFilterState.startYear ?? '',
+    feedFilterState.endYear ?? '',
+    getGenreSelectionMode(),
+    Array.from(getSelectedGenreIdSet())
+      .sort((a, b) => a - b)
+      .join(',')
+  ];
+  return normalized.join('|');
+}
+
 function buildGenreQueryParams() {
   const mode = getGenreSelectionMode();
   if (mode === 'all') {
     return { blockAll: false, withGenres: null };
   }
   if (mode === 'none') {
-    return { blockAll: true, withGenres: null };
+    return { blockAll: false, withGenres: null };
   }
   const ids = Array.from(getSelectedGenreIdSet()).sort((a, b) => a - b);
   if (!ids.length) {
-    return { blockAll: true, withGenres: null };
+    return { blockAll: false, withGenres: null };
   }
   const serialized = ids.map(id => id.toString()).join('|');
   return { blockAll: false, withGenres: serialized };
@@ -1042,13 +1200,15 @@ function ensureServerMovieStats() {
     .map(id => id)
     .filter(Boolean);
   const params = new URLSearchParams();
+  params.set('cacheOnly', '1');
   if (excludeIds.length) {
     params.set('excludeIds', excludeIds.join(','));
   }
 
+  const statsUrl = buildMoviesApiUrl('/api/movies/stats');
   const requestContext = {
     signature,
-    promise: fetch(`/api/movies/stats${params.toString() ? `?${params.toString()}` : ''}`)
+    promise: fetch(`${statsUrl}${params.toString() ? `?${params.toString()}` : ''}`)
       .then(res => {
         if (!res.ok) {
           throw new Error(`Request failed: ${res.status}`);
@@ -1164,6 +1324,49 @@ function buildMovieStats() {
   };
 }
 
+function getCachedCatalogSize() {
+  if (serverMovieStats && Number.isFinite(Number(serverMovieStats.catalogTotal))) {
+    return Number(serverMovieStats.catalogTotal);
+  }
+  if (lastCatalogMetadata && typeof lastCatalogMetadata === 'object') {
+    const candidates = [
+      lastCatalogMetadata.totalCatalogSize,
+      lastCatalogMetadata.totalCatalog,
+      lastCatalogMetadata.total,
+      lastCatalogMetadata.curatedCount,
+      lastCatalogMetadata.curatedReturnedCount
+    ];
+    for (const value of candidates) {
+      if (Number.isFinite(Number(value)) && Number(value) > 0) {
+        return Number(value);
+      }
+    }
+  }
+  return null;
+}
+
+function buildCatalogLoadStatusMessage(loadedCount, visibleMatches) {
+  const safeLoaded = Number.isFinite(Number(loadedCount))
+    ? Math.max(0, Math.round(Number(loadedCount)))
+    : 0;
+  const safeMatches = Number.isFinite(Number(visibleMatches))
+    ? Math.max(0, Math.round(Number(visibleMatches)))
+    : 0;
+  const catalogSize = getCachedCatalogSize();
+  const classifiedCount = getClassifiedMovieIds().length;
+  let catalogDetails = '';
+
+  if (Number.isFinite(catalogSize) && catalogSize >= safeLoaded) {
+    const details = [`${catalogSize} total in catalog`];
+    if (classifiedCount > 0) {
+      details.push(`${classifiedCount} already classified`);
+    }
+    catalogDetails = ` (${details.join('; ')})`;
+  }
+
+  return `Loaded ${safeLoaded} movie${safeLoaded === 1 ? '' : 's'} from the catalog${catalogDetails}. ${safeMatches} ${safeMatches === 1 ? 'movie matches' : 'movies match'} your current filters.`;
+}
+
 function updateMovieStats() {
   const doc = getDocument();
   if (!doc) return;
@@ -1172,6 +1375,296 @@ function updateMovieStats() {
   ensureServerMovieStats();
   const stats = buildMovieStats();
   renderMediaStats(container, stats);
+  updateUnclassifiedCount();
+}
+
+function updateUnclassifiedCount() {
+  const el = domRefs.unclassifiedCount;
+  if (!el) return;
+  el.textContent = '';
+}
+
+function handleRatingDistributionToggle() {
+  ratingDistributionVisible = !ratingDistributionVisible;
+  updateRatingDistributionPanel();
+}
+
+function updateRatingDistributionPanel() {
+  const toggle = domRefs.ratingDistributionToggle;
+  const panel = domRefs.ratingDistributionPanel;
+  const footnote = panel?.querySelector('.movie-rating-distribution__footnote') || null;
+  const hasFilters = hasActiveFeedFilters();
+  const toggleLabel = hasFilters
+    ? 'Show filtered rating distribution'
+    : 'Show catalog rating distribution';
+  const toggleLabelActive = hasFilters
+    ? 'Hide filtered rating distribution'
+    : 'Hide catalog rating distribution';
+  if (toggle) {
+    toggle.setAttribute('aria-expanded', ratingDistributionVisible ? 'true' : 'false');
+    toggle.textContent = ratingDistributionVisible ? toggleLabelActive : toggleLabel;
+  }
+  if (footnote) {
+    footnote.textContent = hasFilters
+      ? 'Top 5 rating ranges at 0.1 increments after applying your filters (excluding min rating).'
+      : 'Top 5 rating ranges at 0.1 increments from the movie catalog.';
+  }
+  if (panel) {
+    panel.hidden = !ratingDistributionVisible;
+  }
+  if (!ratingDistributionVisible) return;
+  renderRatingDistributionLoading();
+
+  const moviesForDistribution = getRatingDistributionMovies();
+  if (moviesForDistribution) {
+    renderRatingDistributionItems(buildLocalRatingDistribution(moviesForDistribution));
+    return;
+  }
+
+  ensureRatingDistributionData()
+    .then(items => {
+      renderRatingDistributionItems(items);
+    })
+    .catch(err => {
+      console.warn('Rating distribution fetch failed', err);
+      renderRatingDistributionItems(buildLocalRatingDistribution());
+    });
+}
+
+function renderRatingDistributionLoading() {
+  const list = domRefs.ratingDistributionList;
+  if (!list) return;
+  list.innerHTML =
+    '<li class="movie-rating-distribution__item">Loading rating distribution…</li>';
+}
+
+function renderRatingDistributionItems(items) {
+  const list = domRefs.ratingDistributionList;
+  if (!list) return;
+  const bucketItems = Array.isArray(items) ? items.slice() : [];
+  if (!bucketItems.length) {
+    list.innerHTML =
+      '<li class="movie-rating-distribution__item">Rating distribution data unavailable.</li>';
+    return;
+  }
+  bucketItems.sort((a, b) => {
+    const aValue = Number.parseFloat(String(a?.label ?? '')) || 0;
+    const bValue = Number.parseFloat(String(b?.label ?? '')) || 0;
+    return bValue - aValue;
+  });
+  const formatted = bucketItems
+    .map(item => {
+      const rawLabel = String(item.label ?? '');
+      const parsed = Number.parseFloat(rawLabel);
+      const label = Number.isFinite(parsed) ? parsed.toFixed(1) : rawLabel;
+      const count = Number.isFinite(Number(item.count)) ? Number(item.count) : 0;
+      const isActive = feedFilterState.minRating === label;
+      const buttonClass = isActive
+        ? 'movie-rating-distribution__value movie-rating-distribution__value--active'
+        : 'movie-rating-distribution__value';
+      return `
+        <li class="movie-rating-distribution__item">
+          <button
+            type="button"
+            class="${buttonClass}"
+            data-rating="${escapeForAttribute(label)}"
+            aria-pressed="${isActive ? 'true' : 'false'}"
+          >
+            ${escapeForAttribute(label)}
+          </button>
+          <span>${formatStatValue(count)} titles</span>
+        </li>`;
+    })
+    .join('');
+  list.innerHTML = formatted;
+  const buttons = Array.from(list.querySelectorAll('[data-rating]'));
+  buttons.forEach(btn => {
+    btn.addEventListener('click', () => {
+      const value = btn.dataset.rating;
+      const nextValue = feedFilterState.minRating === value ? '' : value;
+      setFeedFilter('minRating', nextValue, { sanitize: true, persist: true });
+      updateRatingDistributionPanel();
+    });
+  });
+}
+
+function getRatingDistributionMovies() {
+  if (!Array.isArray(currentMovies) || !currentMovies.length) {
+    return null;
+  }
+  const baseMovies = getFeedMovies(currentMovies);
+  if (!baseMovies.length) return [];
+  return applyFeedFiltersWithOverrides(baseMovies, { minRating: '' });
+}
+
+function buildLocalRatingDistribution(moviesInput) {
+  const movies = Array.isArray(moviesInput)
+    ? moviesInput
+    : getAllUnclassifiedMovieSummaries();
+  if (!movies.length) return [];
+  const precision =
+    Number.isFinite(Number(RATING_DISTRIBUTION_PRECISION)) && RATING_DISTRIBUTION_PRECISION > 0
+      ? Number(RATING_DISTRIBUTION_PRECISION)
+      : 0.1;
+  const limit =
+    Number.isFinite(Number(RATING_DISTRIBUTION_LIMIT)) && RATING_DISTRIBUTION_LIMIT > 0
+      ? Math.max(1, Math.floor(Number(RATING_DISTRIBUTION_LIMIT)))
+      : 5;
+  const decimalPlaces = (() => {
+    const normalized = String(precision);
+    const dotIndex = normalized.indexOf('.');
+    return dotIndex === -1 ? 0 : normalized.length - dotIndex - 1;
+  })();
+  const bucketCounts = new Map();
+  const clampValue = value => Math.max(0, Math.min(10, value));
+  const safeFloor = value => Math.floor((value + precision * 1e-8) / precision);
+  movies.forEach(movie => {
+    const rawScore =
+      Number(movie.score ?? movie.vote_average ?? movie.voteAverage ?? movie.rating);
+    if (!Number.isFinite(rawScore)) return;
+    const clamped = clampValue(rawScore);
+    let bucketValue = safeFloor(clamped) * precision;
+    if (bucketValue > 10) bucketValue = 10;
+    const labelValue = Number(bucketValue.toFixed(decimalPlaces));
+    bucketCounts.set(labelValue, (bucketCounts.get(labelValue) || 0) + 1);
+  });
+  if (!bucketCounts.size) return [];
+  return Array.from(bucketCounts.entries())
+    .sort((a, b) => b[0] - a[0])
+    .slice(0, limit)
+    .map(([value, count]) => ({
+      label: Number(value).toFixed(decimalPlaces),
+      count
+    }));
+}
+
+function applyFeedFiltersWithOverrides(movies, overrides = {}) {
+  if (!Array.isArray(movies) || !movies.length) return [];
+  const localState = {
+    ...feedFilterState,
+    ...overrides
+  };
+
+  const minRating = getFilterFloat(localState.minRating, 0, 10);
+  const minVotes = getFilterInt(localState.minVotes, 0);
+  let startYear = getFilterInt(localState.startYear, 1800, 3000);
+  let endYear = getFilterInt(localState.endYear, 1800, 3000);
+
+  if (startYear != null && endYear != null && endYear < startYear) {
+    const temp = startYear;
+    startYear = endYear;
+    endYear = temp;
+  }
+
+  const genreMode = getGenreSelectionMode();
+  const selectedGenres = getSelectedGenreIdSet();
+  const disallowedGenres = getDisallowedGenreIdSet();
+  const genreDataAvailable = movies.some(movie => getMovieGenreIdSet(movie).size > 0);
+  const filterByGenres = genreDataAvailable && genreMode === 'custom' && selectedGenres.size > 0;
+  const enforceDisallowed = genreDataAvailable && disallowedGenres.size > 0;
+
+  return movies.filter(movie => {
+    if (minRating != null) {
+      const rating = getVoteAverageValue(movie);
+      if (rating == null || rating < minRating) {
+        return false;
+      }
+    }
+
+    if (minVotes != null) {
+      const votes = getVoteCountValue(movie);
+      if (votes == null || votes < minVotes) {
+        return false;
+      }
+    }
+
+    if (startYear != null || endYear != null) {
+      const year = getMovieReleaseYear(movie);
+      if (startYear != null && (year == null || year < startYear)) {
+        return false;
+      }
+      if (endYear != null && (year == null || year > endYear)) {
+        return false;
+      }
+    }
+
+    if (filterByGenres) {
+      const ids = getMovieGenreIdSet(movie);
+      if (!ids.size) {
+        return false;
+      }
+      let matches = false;
+      for (const selectedId of selectedGenres) {
+        if (ids.has(selectedId)) {
+          matches = true;
+          break;
+        }
+      }
+      if (!matches) {
+        return false;
+      }
+    }
+
+    if (enforceDisallowed) {
+      const ids = getMovieGenreIdSet(movie);
+      if (ids.size) {
+        for (const disallowedId of disallowedGenres) {
+          if (ids.has(disallowedId)) {
+            return false;
+          }
+        }
+      }
+    }
+
+    return true;
+  });
+}
+
+function ensureRatingDistributionData() {
+  if (Array.isArray(ratingDistributionData) && ratingDistributionData.length) {
+    return Promise.resolve(ratingDistributionData);
+  }
+  if (!pendingRatingDistributionPromise) {
+    const excludeIds = getClassifiedMovieIds()
+      .map(id => id)
+      .filter(Boolean);
+    const params = new URLSearchParams();
+    params.set('cacheOnly', '1');
+    params.set('ratingPrecision', String(RATING_DISTRIBUTION_PRECISION));
+    params.set('ratingTop', String(RATING_DISTRIBUTION_LIMIT));
+    if (excludeIds.length) {
+      params.set('excludeIds', excludeIds.join(','));
+    }
+    const statsUrl = buildMoviesApiUrl('/api/movies/stats');
+    const request = fetch(`${statsUrl}?${params.toString()}`)
+      .then(res => {
+        if (!res.ok) {
+          throw new Error(`Rating distribution request failed (${res.status})`);
+        }
+        return res.json();
+      })
+      .then(data => {
+        const list = Array.isArray(data?.ratingDistribution) ? data.ratingDistribution : [];
+        if (list.length) {
+          ratingDistributionData = list;
+          return list;
+        }
+        const fallback = buildLocalRatingDistribution();
+        ratingDistributionData = fallback;
+        return fallback;
+      })
+      .catch(err => {
+        const fallback = buildLocalRatingDistribution();
+        ratingDistributionData = fallback;
+        console.warn('Failed to load rating distribution', err);
+        return fallback;
+      })
+      .finally(() => {
+        pendingRatingDistributionPromise = null;
+      });
+    pendingRatingDistributionPromise = request;
+  }
+  return pendingRatingDistributionPromise;
 }
 
 function hasActiveFeedFilters() {
@@ -1184,7 +1677,7 @@ function hasActiveFeedFilters() {
   ) {
     return true;
   }
-  return getGenreSelectionMode() !== 'all';
+  return getGenreSelectionMode() === 'custom';
 }
 
 function updateFeedGenreUI() {
@@ -1286,27 +1779,6 @@ function populateFeedGenreOptions() {
   const wrapper = document.createElement('div');
   wrapper.className = 'genre-facet';
 
-  const controls = document.createElement('div');
-  controls.className = 'genre-facet-controls';
-
-  const selectAllBtn = document.createElement('button');
-  selectAllBtn.type = 'button';
-  selectAllBtn.className = 'genre-facet-action genre-filter-btn';
-  selectAllBtn.dataset.genreAction = 'select-all';
-  selectAllBtn.textContent = 'Select all';
-  selectAllBtn.addEventListener('click', handleGenreSelectionAction);
-  controls.appendChild(selectAllBtn);
-
-  const selectNoneBtn = document.createElement('button');
-  selectNoneBtn.type = 'button';
-  selectNoneBtn.className = 'genre-facet-action genre-filter-btn';
-  selectNoneBtn.dataset.genreAction = 'select-none';
-  selectNoneBtn.textContent = 'Select none';
-  selectNoneBtn.addEventListener('click', handleGenreSelectionAction);
-  controls.appendChild(selectNoneBtn);
-
-  wrapper.appendChild(controls);
-
   const options = document.createElement('div');
   options.className = 'genre-facet-options';
 
@@ -1331,9 +1803,26 @@ function populateFeedGenreOptions() {
 
   wrapper.appendChild(options);
 
-  const summary = document.createElement('div');
-  summary.className = 'genre-facet-summary';
-  wrapper.appendChild(summary);
+  const controls = document.createElement('div');
+  controls.className = 'genre-facet-controls';
+
+  const selectAllBtn = document.createElement('button');
+  selectAllBtn.type = 'button';
+  selectAllBtn.className = 'genre-facet-action genre-filter-btn';
+  selectAllBtn.dataset.genreAction = 'select-all';
+  selectAllBtn.textContent = 'Select all';
+  selectAllBtn.addEventListener('click', handleGenreSelectionAction);
+  controls.appendChild(selectAllBtn);
+
+  const selectNoneBtn = document.createElement('button');
+  selectNoneBtn.type = 'button';
+  selectNoneBtn.className = 'genre-facet-action genre-filter-btn';
+  selectNoneBtn.dataset.genreAction = 'select-none';
+  selectNoneBtn.textContent = 'Select none';
+  selectNoneBtn.addEventListener('click', handleGenreSelectionAction);
+  controls.appendChild(selectNoneBtn);
+
+  wrapper.appendChild(controls);
 
   container.appendChild(wrapper);
 
@@ -1385,7 +1874,12 @@ function attachFeedFilterInput(element, name) {
   }
 
   const inputHandler = event => {
-    setFeedFilter(name, event.target.value, { persist: false });
+    const value = event.target.value;
+    if (value === '') {
+      setFeedFilter(name, value, { sanitize: true, persist: true });
+      return;
+    }
+    setFeedFilter(name, value, { persist: false });
   };
 
   const changeHandler = event => {
@@ -1396,6 +1890,7 @@ function attachFeedFilterInput(element, name) {
   element._feedFilterChangeHandler = changeHandler;
   element.addEventListener('input', inputHandler);
   element.addEventListener('change', changeHandler);
+  element.addEventListener('blur', changeHandler);
 }
 
 function attachFeedFilterSelect(element, name) {
@@ -1419,27 +1914,39 @@ async function loadPreferences() {
       const authed = await awaitAuthUser().catch(() => null);
       const user = getCurrentUser() || authed;
       const key = user?.uid || 'anonymous';
-      activeUserId = user?.uid || null;
       if (prefsLoadedFor === key) return currentPrefs;
       let prefs = {};
+      let discoverState = null;
+      let loadedFromRemote = false;
+      let permissionDenied = false;
+
       if (user) {
         try {
           const snap = await db.collection(PREF_COLLECTION).doc(user.uid).get();
           const data = snap.exists ? snap.data() : null;
           const storedPrefs = data?.prefs;
           prefs = (storedPrefs && typeof storedPrefs === 'object') ? storedPrefs : {};
-          hydrateTmdbDiscoverState(data?.[TMDB_DISCOVER_STATE_FIELD] || null);
+          discoverState = data?.[TMDB_DISCOVER_STATE_FIELD] || null;
+          loadedFromRemote = true;
         } catch (err) {
-          console.error('Failed to load movie preferences', err);
-          prefs = {};
-          hydrateTmdbDiscoverState(null);
+          permissionDenied = err && err.code === 'permission-denied';
+          if (permissionDenied) {
+            console.warn('Firestore permission denied when loading movie preferences; falling back to local cache.');
+          } else {
+            console.error('Failed to load movie preferences', err);
+          }
         }
-      } else {
-        prefs = loadLocalPrefs();
-        hydrateTmdbDiscoverState(loadLocalDiscoverState());
       }
+
+      if (!loadedFromRemote) {
+        prefs = loadLocalPrefs();
+        discoverState = loadLocalDiscoverState();
+      }
+      hydrateTmdbDiscoverState(discoverState);
+
       prefsLoadedFor = key;
       currentPrefs = prefs || {};
+      activeUserId = loadedFromRemote && !permissionDenied ? user?.uid || null : null;
       return currentPrefs;
     })().finally(() => {
       loadingPrefsPromise = null;
@@ -1451,16 +1958,23 @@ async function loadPreferences() {
 async function savePreferences(prefs) {
   currentPrefs = prefs;
   const authed = await awaitAuthUser().catch(() => null);
-  const user = getCurrentUser() || authed || (activeUserId ? { uid: activeUserId } : null);
-  const uid = user?.uid || activeUserId;
-  if (!uid) {
+  const user = getCurrentUser() || authed;
+  if (!user) {
+    activeUserId = null;
     saveLocalPrefs(prefs);
     return;
   }
+  const uid = user.uid;
   activeUserId = uid;
   try {
     await db.collection(PREF_COLLECTION).doc(uid).set({ prefs }, { merge: true });
   } catch (err) {
+    if (err && err.code === 'permission-denied') {
+      console.warn('Firestore permission denied when saving movie preferences; caching locally.');
+      activeUserId = null;
+      saveLocalPrefs(prefs);
+      return;
+    }
     console.error('Failed to save movie preferences', err);
   }
 }
@@ -1483,6 +1997,7 @@ function persistApiKey(key) {
   if (domRefs.apiKeyContainer) {
     domRefs.apiKeyContainer.style.display = 'none';
   }
+  updateApiKeyStatus(key);
 }
 
 function resolveApiKey() {
@@ -1491,6 +2006,21 @@ function resolveApiKey() {
   }
   const value = domRefs.apiKeyInput?.value;
   return typeof value === 'string' ? value.trim() : '';
+}
+
+function canFetchFromTmdb() {
+  const usingProxy = Boolean(getTmdbProxyEndpoint());
+  const apiKey = resolveApiKey();
+  return usingProxy || Boolean(apiKey);
+}
+
+function updateApiKeyStatus(key) {
+  if (!domRefs.apiKeyStatus) return;
+  if (key) {
+    domRefs.apiKeyStatus.textContent = 'TMDB API key applied.';
+  } else {
+    domRefs.apiKeyStatus.textContent = '';
+  }
 }
 
 function getTmdbProxyEndpoint() {
@@ -1508,6 +2038,7 @@ function disableTmdbProxy() {
   if (domRefs.apiKeyContainer) {
     domRefs.apiKeyContainer.style.display = '';
   }
+  updateApiKeyStatus(activeApiKey);
 }
 
 function isProxyEndpointSupported(endpoint) {
@@ -1646,6 +2177,7 @@ function summarizeMovie(movie) {
     title: movie.title || movie.name || '',
     release_date: movie.release_date || '',
     poster_path: movie.poster_path || '',
+    backdrop_path: movie.backdrop_path || '',
     overview: movie.overview || '',
     vote_average: movie.vote_average ?? null,
     vote_count: movie.vote_count ?? null,
@@ -1669,12 +2201,32 @@ function captureRestoredMovie(movie) {
   return summary;
 }
 
-function makeActionButton(label, handler) {
+function makeActionButton(label, handler, options = {}) {
   const btn = document.createElement('button');
   btn.type = 'button';
   btn.className = 'movie-action';
   btn.textContent = label;
-  btn.addEventListener('click', handler);
+  const pendingLabel = options.pendingLabel || 'Saving...';
+  btn.addEventListener('click', async () => {
+    if (btn.disabled) return;
+    const originalLabel = btn.textContent;
+    btn.disabled = true;
+    btn.classList.add('movie-action--loading');
+    btn.textContent = pendingLabel;
+    try {
+      const result = handler();
+      if (result && typeof result.then === 'function') {
+        await result;
+      }
+    } catch (err) {
+      console.error('Action failed', err);
+    } finally {
+      if (!btn.isConnected) return;
+      btn.disabled = false;
+      btn.classList.remove('movie-action--loading');
+      btn.textContent = originalLabel;
+    }
+  });
   return btn;
 }
 
@@ -1847,13 +2399,13 @@ function appendPeopleMeta(list, label, names) {
 
 function getVoteAverageValue(movie) {
   if (!movie) return null;
-  const value = Number(movie.vote_average);
+  const value = Number(movie.vote_average ?? movie.score);
   return Number.isFinite(value) ? value : null;
 }
 
 function getVoteCountValue(movie) {
   if (!movie) return null;
-  const value = Number(movie.vote_count);
+  const value = Number(movie.vote_count ?? movie.voteCount);
   return Number.isFinite(value) ? value : null;
 }
 
@@ -1885,6 +2437,65 @@ function getMovieReleaseYear(movie) {
   return Number.isFinite(year) ? year : null;
 }
 
+function resolvePosterPath(movie) {
+  if (movie?.poster_path) return movie.poster_path;
+  if (movie?.backdrop_path) return movie.backdrop_path;
+  const idValue = movie?.id ?? movie?.movieId ?? movie?.movieID ?? null;
+  if (idValue == null) return '';
+  const key = String(idValue);
+  const restored = restoredMoviesById.get(key);
+  if (restored?.poster_path) return restored.poster_path;
+  if (restored?.backdrop_path) return restored.backdrop_path;
+  if (Array.isArray(currentMovies)) {
+    const match = currentMovies.find(item => String(item?.id) === key);
+    if (match?.poster_path) return match.poster_path;
+    if (match?.backdrop_path) return match.backdrop_path;
+  }
+  return '';
+}
+
+function buildImageUrl(path) {
+  if (!path) return '';
+  const imageProxyBase = buildMoviesApiUrl('/api/movie-image');
+  const buildProxyUrl = (imagePath, size = 'w200') => {
+    if (!imagePath) return '';
+    const params = new URLSearchParams();
+    params.set('path', imagePath);
+    if (size) {
+      params.set('size', size);
+    }
+    return `${imageProxyBase}?${params.toString()}`;
+  };
+
+  if (/^https?:\/\//i.test(path)) {
+    try {
+      const parsed = new URL(path);
+      if (parsed.hostname === 'image.tmdb.org') {
+        const match = parsed.pathname.match(/^\/t\/p\/([^/]+)(\/.+)$/);
+        if (match) {
+          return buildProxyUrl(match[2], match[1] || 'w200');
+        }
+      }
+    } catch (_) {
+      // Ignore parse errors and keep the original URL for non-TMDB images.
+    }
+    return path;
+  }
+
+  const normalizedPath = path.startsWith('/') ? path : `/${path}`;
+  return buildProxyUrl(normalizedPath, 'w200');
+}
+
+function setPosterImageSource(img, posterPath) {
+  if (!img) return;
+  const proxiedSrc = buildImageUrl(posterPath);
+  if (!proxiedSrc) return;
+  img.src = proxiedSrc;
+  img.addEventListener('error', () => {
+    img.removeAttribute('src');
+  }, { once: true });
+}
+
 function getMovieGenreIdSet(movie) {
   const ids = new Set();
   if (movie && Array.isArray(movie.genre_ids)) {
@@ -1906,6 +2517,62 @@ function getMovieGenreIdSet(movie) {
   return ids;
 }
 
+function buildActiveFilterCriteriaDescription() {
+  const parts = [];
+
+  const minRating = getFilterFloat(feedFilterState.minRating, 0, 10);
+  if (minRating != null) {
+    parts.push(`rating >= ${minRating.toFixed(1)}`);
+  }
+
+  const minVotes = getFilterInt(feedFilterState.minVotes, 0);
+  if (minVotes != null) {
+    parts.push(`votes >= ${minVotes.toLocaleString()}`);
+  }
+
+  let startYear = getFilterInt(feedFilterState.startYear, 1800, 3000);
+  let endYear = getFilterInt(feedFilterState.endYear, 1800, 3000);
+  if (startYear != null && endYear != null && endYear < startYear) {
+    const temp = startYear;
+    startYear = endYear;
+    endYear = temp;
+  }
+  if (startYear != null || endYear != null) {
+    if (startYear != null && endYear != null) {
+      parts.push(startYear === endYear ? `year ${startYear}` : `year ${startYear}-${endYear}`);
+    } else if (startYear != null) {
+      parts.push(`year >= ${startYear}`);
+    } else if (endYear != null) {
+      parts.push(`year <= ${endYear}`);
+    }
+  }
+
+  const genreMode = getGenreSelectionMode();
+  if (genreMode === 'none') {
+    parts.push('genres set to none');
+  } else if (genreMode === 'custom') {
+    const ids = Array.from(getSelectedGenreIdSet()).sort((a, b) => a - b);
+    const names = ids
+      .map(id => genreMap?.[id] || genreMap?.[String(id)] || '')
+      .filter(Boolean);
+    let genreLabel = '';
+    if (names.length && names.length <= 4) {
+      genreLabel = `genres: ${names.join(', ')}`;
+    } else if (names.length) {
+      genreLabel = `genres: ${names.length} selected`;
+    } else if (ids.length) {
+      genreLabel = `genres: ${ids.length} selected`;
+    } else {
+      genreLabel = 'genres set to none';
+    }
+    if (genreLabel) {
+      parts.push(genreLabel);
+    }
+  }
+
+  return parts.join(', ');
+}
+
 function applyFeedFilters(movies) {
   if (!Array.isArray(movies) || !movies.length) return [];
 
@@ -1923,9 +2590,10 @@ function applyFeedFilters(movies) {
   const genreMode = getGenreSelectionMode();
   const selectedGenres = getSelectedGenreIdSet();
   const disallowedGenres = getDisallowedGenreIdSet();
-  const filterByGenres = genreMode === 'custom' && selectedGenres.size > 0;
-  const blockAllGenres = genreMode === 'none';
-  const enforceDisallowed = disallowedGenres.size > 0;
+  const genreDataAvailable = movies.some(movie => getMovieGenreIdSet(movie).size > 0);
+  const filterByGenres = genreDataAvailable && genreMode === 'custom' && selectedGenres.size > 0;
+  const blockAllGenres = false;
+  const enforceDisallowed = genreDataAvailable && disallowedGenres.size > 0;
 
   return movies.filter(movie => {
     if (blockAllGenres) {
@@ -1960,6 +2628,9 @@ function applyFeedFilters(movies) {
       const ids = getMovieGenreIdSet(movie);
 
       if (filterByGenres) {
+        if (!ids.size) {
+          return false;
+        }
         let matches = false;
         for (const selectedId of selectedGenres) {
           if (ids.has(selectedId)) {
@@ -1972,7 +2643,7 @@ function applyFeedFilters(movies) {
         }
       }
 
-      if (enforceDisallowed) {
+      if (enforceDisallowed && ids.size) {
         for (const disallowedId of disallowedGenres) {
           if (ids.has(disallowedId)) {
             return false;
@@ -2022,13 +2693,34 @@ function createUserRatingElement(pref) {
     }
   }
 
+  let ratingDebounce = null;
+  const queueRatingUpdate = value => {
+    if (ratingDebounce) {
+      clearTimeout(ratingDebounce);
+    }
+    ratingDebounce = setTimeout(() => {
+      setUserRating(pref.movie.id, value);
+    }, 150);
+  };
+  input.addEventListener('input', event => {
+    const raw = event.target.value;
+    if (raw === '') return;
+    const value = Number.parseFloat(raw);
+    if (Number.isNaN(value)) return;
+    queueRatingUpdate(value);
+  });
   input.addEventListener('change', event => {
-    const value = Number.parseFloat(event.target.value);
+    const raw = event.target.value;
+    if (raw === '') {
+      setUserRating(pref.movie.id, null);
+      return;
+    }
+    const value = Number.parseFloat(raw);
     if (Number.isNaN(value)) {
       setUserRating(pref.movie.id, null);
       return;
     }
-    setUserRating(pref.movie.id, value);
+    queueRatingUpdate(value);
   });
 
   container.appendChild(input);
@@ -2220,7 +2912,7 @@ async function fetchCreditsForMovie(movieId, { usingProxy, apiKey }) {
 
 async function enrichMoviesWithCredits(movies, options = {}) {
   if (!Array.isArray(movies) || !movies.length) return;
-  const { prefetchedCredits, ...fetchOptions } = options;
+  const { prefetchedCredits, skipFetch, ...fetchOptions } = options;
   const byId = new Map();
   movies.forEach(movie => {
     if (!movie || movie.id == null) return;
@@ -2234,6 +2926,8 @@ async function enrichMoviesWithCredits(movies, options = {}) {
       applyCreditsToMovie(movie, credits);
     });
   }
+
+  if (skipFetch) return;
 
   const limit = Math.min(MAX_CREDIT_REQUESTS, movies.length);
   const targets = movies
@@ -2288,14 +2982,15 @@ async function setStatus(movie, status, options = {}) {
     delete entry.userRating;
   }
   next[id] = entry;
+  const removalPromise = SUPPRESSED_STATUSES.has(status)
+    ? animateFeedRemoval(id)
+    : Promise.resolve(false);
   await savePreferences(next);
+  await removalPromise;
   pruneSuppressedMovies();
   refreshUI();
   if (status === 'watched' && !skipRatingPrompt) {
     await promptForUserRating(movie);
-  }
-  if (!getFeedMovies(currentMovies).length) {
-    requestAdditionalMovies();
   }
 }
 
@@ -2329,8 +3024,10 @@ async function promptForUserRating(movie) {
 }
 
 async function setUserRating(movieId, rating) {
-  await loadPreferences();
   const id = String(movieId);
+  if (!currentPrefs[id]) {
+    await loadPreferences();
+  }
   const pref = currentPrefs[id];
   if (!pref || pref.status !== 'watched') return;
 
@@ -2344,8 +3041,11 @@ async function setUserRating(movieId, rating) {
   }
   entry.updatedAt = Date.now();
   next[id] = entry;
-  await savePreferences(next);
-  refreshUI();
+  currentPrefs = next;
+  renderWatchedList();
+  savePreferences(next).catch(err => {
+    console.error('Failed to save movie rating', err);
+  });
 }
 
 async function clearStatus(movieId) {
@@ -2365,15 +3065,11 @@ async function clearStatus(movieId) {
       if (!exists) {
         currentMovies = [restored, ...(Array.isArray(currentMovies) ? currentMovies : [])];
         currentMovies = applyPriorityOrdering(currentMovies);
-        feedExhausted = false;
       }
     }
   }
   pruneSuppressedMovies();
   refreshUI();
-  if (!getFeedMovies(currentMovies).length) {
-    requestAdditionalMovies();
-  }
 }
 
 function getFeedMovies(movies) {
@@ -2391,47 +3087,131 @@ function isMovieSuppressed(movieId) {
 function pruneSuppressedMovies() {
   if (!Array.isArray(currentMovies) || !currentMovies.length) return;
   currentMovies = currentMovies.filter(movie => !isMovieSuppressed(movie?.id));
-  feedExhausted = false;
 }
 
-async function requestAdditionalMovies() {
-  const now = Date.now();
-  if (refillInProgress) {
-    const started = formatTimestamp(lastRefillAttempt);
-    const label = started ? ` (started at ${started})` : '';
-    updateFeedStatus(`Movie request already in progress${label}.`, {
-      tone: 'info',
-      showSpinner: true
-    });
-    return;
+function escapeCssValue(value) {
+  if (typeof value !== 'string') return '';
+  if (typeof CSS !== 'undefined' && CSS && typeof CSS.escape === 'function') {
+    return CSS.escape(value);
   }
-  if (now - lastRefillAttempt < REFILL_COOLDOWN_MS) {
-    const waitMs = Math.max(0, REFILL_COOLDOWN_MS - (now - lastRefillAttempt));
-    const waitSeconds = Math.ceil(waitMs / 1000);
-    updateFeedStatus(`Waiting ${waitSeconds}s before requesting more movies...`, {
-      tone: 'info'
-    });
-    if (!pendingRefillCooldownTimer) {
-      pendingRefillCooldownTimer = setTimeout(() => {
-        pendingRefillCooldownTimer = null;
-        requestAdditionalMovies();
-      }, waitMs);
+  return value.replace(/["\\]/g, '\\$&');
+}
+
+function animateFeedRemoval(movieId) {
+  if (movieId == null) return Promise.resolve(false);
+  const listEl = domRefs.list;
+  if (!listEl) return Promise.resolve(false);
+  const selector = `li.movie-card[data-movie-id="${escapeCssValue(String(movieId))}"]`;
+  const card = listEl.querySelector(selector);
+  if (!card || card.classList.contains('movie-card--removing')) {
+    return Promise.resolve(Boolean(card));
+  }
+  const canAnimate = typeof requestAnimationFrame === 'function';
+  if (!canAnimate) {
+    if (card.parentElement) {
+      card.parentElement.removeChild(card);
     }
-    return;
+    return Promise.resolve(true);
   }
-  if (pendingRefillCooldownTimer) {
-    clearTimeout(pendingRefillCooldownTimer);
-    pendingRefillCooldownTimer = null;
+
+  const height = card.getBoundingClientRect().height;
+  card.style.maxHeight = `${height}px`;
+  card.style.pointerEvents = 'none';
+  card.classList.add('movie-card--removing');
+
+  requestAnimationFrame(() => {
+    card.style.maxHeight = '0px';
+  });
+
+  return new Promise(resolve => {
+    const finalize = () => {
+      if (card.parentElement) {
+        card.parentElement.removeChild(card);
+      }
+      resolve(true);
+    };
+    const timeout = setTimeout(finalize, 260);
+    card.addEventListener(
+      'transitionend',
+      () => {
+        clearTimeout(timeout);
+        finalize();
+      },
+      { once: true }
+    );
+  });
+}
+
+function createMovieCardElement(movie) {
+  const li = document.createElement('li');
+  li.className = 'movie-card';
+  if (movie?.id != null) {
+    li.dataset.movieId = String(movie.id);
   }
-  refillInProgress = true;
-  lastRefillAttempt = now;
-  feedExhausted = false;
-  try {
-    await loadMovies({ attemptStart: now });
-  } finally {
-    refillInProgress = false;
-    renderFeed();
+
+  const posterPath = resolvePosterPath(movie);
+  if (posterPath) {
+    const img = document.createElement('img');
+    setPosterImageSource(img, posterPath);
+    img.alt = `${movie.title || movie.name || 'Movie'} poster`;
+    li.appendChild(img);
   }
+
+  const info = document.createElement('div');
+  info.className = 'movie-info';
+
+  const titleText = ((movie?.title || movie?.name || '') + '').trim();
+  const year = (String(movie?.release_date || '').split('-')[0] || 'Unknown');
+  const titleEl = document.createElement('h3');
+  titleEl.textContent = `${titleText} (${year})`;
+  info.appendChild(titleEl);
+
+  const btnRow = document.createElement('div');
+  btnRow.className = 'button-row';
+  btnRow.append(
+    makeActionButton('Watched Already', () => setStatus(movie, 'watched')),
+    makeActionButton('Not Interested', () => setStatus(movie, 'notInterested')),
+    makeActionButton('Interested', async () => {
+      const existing = currentPrefs?.[String(movie?.id)];
+      const initialInterest =
+        Number.isFinite(existing?.interest) && existing?.interest >= 1 && existing?.interest <= 5
+          ? Math.round(existing.interest)
+          : DEFAULT_INTEREST;
+      const interest = promptForInterest(initialInterest);
+      if (interest == null) return;
+      await setStatus(movie, 'interested', { interest });
+    })
+  );
+  info.appendChild(btnRow);
+
+  const metaList = document.createElement('ul');
+  metaList.className = 'movie-meta';
+
+  appendGenresMeta(metaList, movie);
+  appendMeta(metaList, 'Average Score', movie?.vote_average ?? 'N/A');
+  appendMeta(metaList, 'Votes', movie?.vote_count ?? 'N/A');
+  appendMeta(metaList, 'Release Date', movie?.release_date || 'Unknown');
+  appendPeopleMeta(metaList, 'Director', movie?.directors);
+  appendPeopleMeta(metaList, 'Cast', movie?.topCast);
+  appendCriticScoresMeta(metaList, movie);
+
+  if (metaList.childNodes.length) {
+    info.appendChild(metaList);
+  }
+
+  if (movie?.overview) {
+    const overview = document.createElement('p');
+    overview.textContent = movie.overview;
+    info.appendChild(overview);
+  }
+
+  const rtLink = createRottenTomatoesLink(titleText);
+  if (rtLink) {
+    info.appendChild(rtLink);
+  }
+
+  li.appendChild(info);
+  return li;
 }
 
 function renderFeed() {
@@ -2440,166 +3220,76 @@ function renderFeed() {
   updateMovieStats();
   if (!listEl) return;
 
+  if (Array.isArray(currentMovies) && currentMovies.length > 1) {
+    currentMovies = dedupeMoviesById(currentMovies);
+  }
+
+  const filterSignature = getFeedFilterSignature();
+  lastRenderedFilterSignature = filterSignature;
+
   if (!currentMovies.length) {
-    if (refillInProgress) {
-      listEl.innerHTML = '<em>Loading more movies...</em>';
-      updateFeedStatus('Waiting for movies from TMDB...', {
-        tone: 'info',
-        showSpinner: true
-      });
-      return;
-    }
-    if (feedExhausted) {
-      listEl.innerHTML = hasActiveFeedFilters()
-        ? '<em>No movies match the current filters.</em>'
-        : '<em>No movies found.</em>';
-      updateFeedStatus(
-        hasActiveFeedFilters()
-          ? 'TMDB did not return movies that match your filters.'
-          : 'TMDB did not return any movies. Try again later.',
-        { tone: 'warning' }
-      );
-      return;
-    }
-    listEl.innerHTML = '<em>Loading more movies...</em>';
-    updateFeedStatus('Requesting the first batch of movies...', {
-      tone: 'info',
-      showSpinner: true
-    });
-    requestAdditionalMovies();
+    listEl.innerHTML = hasActiveFeedFilters()
+      ? '<em>No saved movies match the current filters.</em>'
+      : '<em>No saved movies found.</em>';
+    updateFeedStatus(
+      hasActiveFeedFilters()
+        ? 'No saved movies match your filters.'
+        : 'No saved movies found.',
+      { tone: 'warning', location: 'top' }
+    );
+    updateFeedStatus('', { location: 'bottom' });
+    lastRenderedMovieIds = [];
     return;
   }
 
   const availableMovies = getFeedMovies(currentMovies);
 
   if (!availableMovies.length) {
-    if (refillInProgress) {
-      listEl.innerHTML = '<em>Loading more movies...</em>';
-      updateFeedStatus('All current results are hidden; waiting for new movies...', {
-        tone: 'info',
-        showSpinner: true
-      });
-      return;
-    }
-    listEl.innerHTML = '<em>Loading more movies...</em>';
+    listEl.innerHTML = '<em>All saved movies are hidden by saved statuses.</em>';
     updateFeedStatus(
-      'All fetched movies are hidden by saved statuses. Looking for fresh titles...',
-      { tone: 'warning', showSpinner: true }
+      'All saved movies are hidden by saved statuses.',
+      { tone: 'warning', location: 'top' }
     );
-    requestAdditionalMovies();
+    updateFeedStatus('', { location: 'bottom' });
+    lastRenderedMovieIds = [];
     return;
   }
 
-  const filteredMovies = applyFeedFilters(availableMovies);
+  let filteredMovies = applyFeedFilters(availableMovies);
+  const hasFilters = hasActiveFeedFilters();
+  if (!filteredMovies.length && !hasFilters && availableMovies.length) {
+    filteredMovies = availableMovies.slice();
+  }
 
   if (!filteredMovies.length) {
-    if (refillInProgress) {
-      listEl.innerHTML = '<em>Loading more movies...</em>';
-      updateFeedStatus('Filters removed the current batch; waiting for more movies...', {
-        tone: 'info',
-        showSpinner: true
-      });
-      return;
-    }
-    if (feedExhausted) {
-      listEl.innerHTML = hasActiveFeedFilters()
-        ? '<em>No movies match the current filters.</em>'
-        : '<em>No movies found.</em>';
-      updateFeedStatus(
-        hasActiveFeedFilters()
-          ? 'Filters are hiding every movie that is currently available.'
-          : 'TMDB did not return any additional movies.',
-        { tone: 'warning' }
-      );
-      return;
-    }
-    listEl.innerHTML = '<em>Loading more movies...</em>';
-    const hiddenByFilters = availableMovies.length;
+    listEl.innerHTML = hasFilters
+      ? '<em>No movies match the current filters.</em>'
+      : '<em>No saved movies are available to display.</em>';
     updateFeedStatus(
-      hiddenByFilters
-        ? `Filters are hiding ${hiddenByFilters} movie${hiddenByFilters === 1 ? '' : 's'}; requesting more options...`
-        : 'Filters removed the current batch; requesting more movies...',
-      { tone: 'warning', showSpinner: true }
+      buildCatalogLoadStatusMessage(availableMovies.length, 0),
+      { tone: 'warning', location: 'top' }
     );
-    requestAdditionalMovies();
+    updateFeedStatus('', { location: 'bottom' });
+    lastRenderedMovieIds = [];
     return;
   }
 
+  const filteredMovieIds = filteredMovies
+    .map(movie => (movie && movie.id != null ? String(movie.id) : ''))
+    .filter(Boolean);
+  listEl.innerHTML = '';
   const ul = document.createElement('ul');
   filteredMovies.forEach(movie => {
-    const li = document.createElement('li');
-    li.className = 'movie-card';
-
-    if (movie.poster_path) {
-      const img = document.createElement('img');
-      img.src = `https://image.tmdb.org/t/p/w200${movie.poster_path}`;
-      img.alt = `${movie.title || movie.name || 'Movie'} poster`;
-      li.appendChild(img);
-    }
-
-    const info = document.createElement('div');
-    info.className = 'movie-info';
-
-    const title = (movie.title || movie.name || '').trim();
-    const year = (movie.release_date || '').split('-')[0] || 'Unknown';
-    const titleEl = document.createElement('h3');
-    titleEl.textContent = `${title} (${year})`;
-    info.appendChild(titleEl);
-
-    const btnRow = document.createElement('div');
-    btnRow.className = 'button-row';
-    btnRow.append(
-      makeActionButton('Watched Already', () => setStatus(movie, 'watched')),
-      makeActionButton('Not Interested', () => setStatus(movie, 'notInterested')),
-      makeActionButton(
-        'Interested',
-        async () => {
-          const existing = currentPrefs?.[String(movie.id)];
-          const initialInterest =
-            Number.isFinite(existing?.interest) && existing?.interest >= 1 && existing?.interest <= 5
-              ? Math.round(existing.interest)
-              : DEFAULT_INTEREST;
-          const interest = promptForInterest(initialInterest);
-          if (interest == null) return;
-          await setStatus(movie, 'interested', { interest });
-        }
-      )
-    );
-    info.appendChild(btnRow);
-
-    const metaList = document.createElement('ul');
-    metaList.className = 'movie-meta';
-
-    appendGenresMeta(metaList, movie);
-    appendMeta(metaList, 'Average Score', movie.vote_average ?? 'N/A');
-    appendMeta(metaList, 'Votes', movie.vote_count ?? 'N/A');
-    appendMeta(metaList, 'Release Date', movie.release_date || 'Unknown');
-    appendPeopleMeta(metaList, 'Director', movie.directors);
-    appendPeopleMeta(metaList, 'Cast', movie.topCast);
-    appendCriticScoresMeta(metaList, movie);
-
-    if (metaList.childNodes.length) {
-      info.appendChild(metaList);
-    }
-
-    if (movie.overview) {
-      const overview = document.createElement('p');
-      overview.textContent = movie.overview;
-      info.appendChild(overview);
-    }
-
-    li.appendChild(info);
-    ul.appendChild(li);
+    ul.appendChild(createMovieCardElement(movie));
   });
-
-  listEl.innerHTML = '';
   listEl.appendChild(ul);
+  lastRenderedMovieIds = filteredMovieIds;
   updateFeedStatus(
-    `Showing ${filteredMovies.length} movie${filteredMovies.length === 1 ? '' : 's'} (updated ${formatTimestamp(
-      Date.now()
-    )}).`,
-    { tone: 'success' }
+    buildCatalogLoadStatusMessage(availableMovies.length, filteredMovies.length),
+    { tone: 'success', location: 'top' }
   );
+
+  updateFeedStatus('', { tone: 'success', location: 'bottom' });
 }
 
 function renderInterestedList() {
@@ -2657,9 +3347,10 @@ function renderInterestedList() {
     const li = document.createElement('li');
     li.className = 'movie-card';
 
-    if (movie.poster_path) {
+    const posterPath = resolvePosterPath(movie);
+    if (posterPath) {
       const img = document.createElement('img');
-      img.src = `https://image.tmdb.org/t/p/w200${movie.poster_path}`;
+      setPosterImageSource(img, posterPath);
       img.alt = `${movie.title || 'Movie'} poster`;
       li.appendChild(img);
     }
@@ -2705,6 +3396,11 @@ function renderInterestedList() {
       info.appendChild(overview);
     }
 
+    const rtLink = createRottenTomatoesLink(movie.title || '');
+    if (rtLink) {
+      info.appendChild(rtLink);
+    }
+
     const metaList = document.createElement('ul');
     metaList.className = 'movie-meta';
     appendGenresMeta(metaList, movie);
@@ -2717,7 +3413,10 @@ function renderInterestedList() {
 
     const controls = document.createElement('div');
     controls.className = 'button-row';
-    controls.append(makeActionButton('Remove', () => clearStatus(movie.id)));
+    controls.append(
+      makeActionButton('Mark Watched', () => setStatus(movie, 'watched')),
+      makeActionButton('Remove', () => clearStatus(movie.id))
+    );
     info.appendChild(controls);
 
     li.appendChild(info);
@@ -2817,9 +3516,10 @@ function renderWatchedList() {
     const li = document.createElement('li');
     li.className = 'movie-card';
 
-    if (movie.poster_path) {
+    const posterPath = resolvePosterPath(movie);
+    if (posterPath) {
       const img = document.createElement('img');
-      img.src = `https://image.tmdb.org/t/p/w200${movie.poster_path}`;
+      setPosterImageSource(img, posterPath);
       img.alt = `${movie.title || 'Movie'} poster`;
       li.appendChild(img);
     }
@@ -2846,6 +3546,11 @@ function renderWatchedList() {
       const overview = document.createElement('p');
       overview.textContent = movie.overview;
       info.appendChild(overview);
+    }
+
+    const rtLink = createRottenTomatoesLink(movie.title || '');
+    if (rtLink) {
+      info.appendChild(rtLink);
     }
 
     const metaList = document.createElement('ul');
@@ -2947,14 +3652,15 @@ function applyPriorityOrdering(movies) {
   const candidates = selectPriorityCandidates(movies);
   if (!candidates.length) return [];
 
-  const maxVotes = Math.max(...candidates.map(m => Math.max(0, m.vote_count || 0)), 1);
+  const maxVotes = Math.max(...candidates.map(m => Math.max(0, getVoteCountValue(m) || 0)), 1);
   const now = Date.now();
   const yearMs = 365 * 24 * 60 * 60 * 1000;
 
   return candidates
     .map(movie => {
-      const rawAverage = Math.max(0, Math.min(10, movie.vote_average ?? 0)) / 10;
-      const votes = Math.max(0, movie.vote_count || 0);
+      const averageValue = getVoteAverageValue(movie) ?? 0;
+      const rawAverage = Math.max(0, Math.min(10, averageValue)) / 10;
+      const votes = Math.max(0, getVoteCountValue(movie) || 0);
       const voteVolume = Math.log10(votes + 1) / Math.log10(maxVotes + 1);
 
       const confidence = Math.min(1, votes / 150);
@@ -2981,8 +3687,48 @@ function applyPriorityOrdering(movies) {
     .sort((a, b) => (b.__priority ?? 0) - (a.__priority ?? 0));
 }
 
+function scoreMovieForMerge(movie) {
+  if (!movie || typeof movie !== 'object') return 0;
+  let score = 0;
+  if (movie.poster_path) score += 3;
+  if (movie.overview) score += 2;
+  if (movie.vote_average != null) score += 1;
+  if (movie.vote_count != null) score += 1;
+  if (movie.release_date) score += 1;
+  if (movie.criticScores) score += 1;
+  if (Array.isArray(movie.directors) && movie.directors.length) score += 1;
+  if (Array.isArray(movie.topCast) && movie.topCast.length) score += 1;
+  if (Array.isArray(movie.genre_ids) && movie.genre_ids.length) score += 1;
+  return score;
+}
+
+function dedupeMoviesById(list) {
+  if (!Array.isArray(list) || !list.length) return list || [];
+  const seen = new Map();
+  const result = [];
+  list.forEach(movie => {
+    if (!movie || movie.id == null) {
+      result.push(movie);
+      return;
+    }
+    const key = String(movie.id);
+    const score = scoreMovieForMerge(movie);
+    const existing = seen.get(key);
+    if (!existing) {
+      seen.set(key, { index: result.length, score });
+      result.push(movie);
+      return;
+    }
+    if (score > existing.score) {
+      result[existing.index] = movie;
+      existing.score = score;
+    }
+  });
+  return result;
+}
+
 function mergeRestoredMovies(baseMovies) {
-  const list = Array.isArray(baseMovies) ? baseMovies.slice() : [];
+  const list = dedupeMoviesById(Array.isArray(baseMovies) ? baseMovies.slice() : []);
   if (!restoredMoviesById.size) {
     return list;
   }
@@ -3059,7 +3805,9 @@ async function fetchGenreMapDirect(apiKey) {
     const res = await fetch(`https://api.themoviedb.org/3/genre/movie/list?api_key=${apiKey}`);
     if (!res.ok) return {};
     const data = await res.json();
-    return Object.fromEntries((data.genres || []).map(g => [g.id, g.name]));
+    const map = Object.fromEntries((data.genres || []).map(g => [g.id, g.name]));
+    storeCachedGenreMap(map);
+    return map;
   } catch (_) {
     return {};
   }
@@ -3342,6 +4090,37 @@ function normalizeCachedMovie(movie) {
     normalized.title = normalized.name;
   }
 
+  if (Array.isArray(normalized.genre_ids)) {
+    const ids = normalized.genre_ids
+      .map(value => Number.parseInt(value, 10))
+      .filter(Number.isFinite);
+    normalized.genre_ids = ids.length ? ids : [];
+  } else {
+    const ids = new Set();
+    const rawIds = normalized.genreIds;
+    if (Array.isArray(rawIds)) {
+      rawIds.forEach(value => {
+        const numeric = Number.parseInt(value, 10);
+        if (Number.isFinite(numeric)) {
+          ids.add(numeric);
+        }
+      });
+    }
+    if (Array.isArray(normalized.genres)) {
+      normalized.genres.forEach(entry => {
+        if (!entry) return;
+        const numeric = Number.parseInt(
+          typeof entry === 'number' ? entry : entry.id,
+          10
+        );
+        if (Number.isFinite(numeric)) {
+          ids.add(numeric);
+        }
+      });
+    }
+    normalized.genre_ids = ids.size ? Array.from(ids) : [];
+  }
+
   if (normalized.criticScores) {
     const scores = normalizeCriticScoresObject(normalized.criticScores);
     if (scores) {
@@ -3370,33 +4149,27 @@ function collectMoviesFromCache(results, suppressedIds) {
   return applyPriorityOrdering(collected);
 }
 
-async function tryFetchCachedMovies({ suppressedIds, minFeedSize }) {
+async function tryFetchCachedMovies({ suppressedIds, excludeIds }) {
   try {
     const params = new URLSearchParams();
-    const minRating = getFilterFloat(feedFilterState.minRating, 0, 10);
-    const minVotes = getFilterInt(feedFilterState.minVotes, 0);
-    let startYear = getFilterInt(feedFilterState.startYear, 1800, 3000);
-    let endYear = getFilterInt(feedFilterState.endYear, 1800, 3000);
-
-    if (startYear != null && endYear != null && endYear < startYear) {
-      const temp = startYear;
-      startYear = endYear;
-      endYear = temp;
+    const combinedExclude = new Set();
+    if (suppressedIds && suppressedIds.size) {
+      suppressedIds.forEach(id => combinedExclude.add(String(id)));
     }
-
-    if (Number.isFinite(minRating)) params.set('minRating', String(minRating));
-    if (Number.isFinite(minVotes)) params.set('minVotes', String(minVotes));
-    if (Number.isFinite(startYear)) params.set('startYear', String(startYear));
-    if (Number.isFinite(endYear)) params.set('endYear', String(endYear));
-    if (suppressedIds.size) params.set('excludeIds', Array.from(suppressedIds).join(','));
-    params.set('limit', String(Math.max(minFeedSize, MIN_PRIORITY_RESULTS)));
+    if (excludeIds && excludeIds.size) {
+      excludeIds.forEach(id => combinedExclude.add(String(id)));
+    }
+    if (combinedExclude.size) {
+      params.set('excludeIds', Array.from(combinedExclude).join(','));
+    }
+    params.set('limit', String(Math.max(MIN_PRIORITY_RESULTS, CACHE_QUERY_LIMIT_ALL)));
 
     const baseUrl = buildMoviesApiUrl('/api/movies');
     const query = params.toString();
     const url = query ? `${baseUrl}?${query}` : baseUrl;
     const res = await fetch(url);
     if (!res.ok) {
-      return null;
+      throw new Error(`Catalog request failed (${res.status})`);
     }
     const data = await res.json();
     const metadata =
@@ -3407,18 +4180,15 @@ async function tryFetchCachedMovies({ suppressedIds, minFeedSize }) {
       lastCatalogMetadata = metadata;
     }
     const prioritized = collectMoviesFromCache(data?.results, suppressedIds);
-    const filtered = applyFeedFilters(prioritized);
-    const satisfied = filtered.length >= minFeedSize;
     return {
       movies: prioritized,
       genres: normalizeGenreMap(data?.genres ?? data?.genreMap),
       credits: normalizeCreditsMap(data?.credits),
-      metadata,
-      satisfied
+      metadata
     };
   } catch (err) {
     console.warn('Failed to load cached movies', err);
-    return null;
+    throw err;
   }
 }
 
@@ -3542,43 +4312,30 @@ async function fetchMoviesFromTmdb({
   return prioritized.length ? prioritized : applyPriorityOrdering(collected);
 }
 
-async function fetchMovies({ usingProxy, apiKey, minFeedSize = MIN_FEED_RESULTS }) {
+async function fetchMovies({ excludeIds } = {}) {
   const suppressedIds = new Set(
     Object.entries(currentPrefs)
       .filter(([, pref]) => pref && SUPPRESSED_STATUSES.has(pref.status))
       .map(([id]) => id)
   );
-
-  const cacheResult = await tryFetchCachedMovies({ suppressedIds, minFeedSize });
-  let movies = Array.isArray(cacheResult?.movies) ? cacheResult.movies : [];
-  let metadata = cacheResult?.metadata || null;
-  let usedTmdbFallback = false;
-
-  if (!cacheResult || !cacheResult.satisfied) {
-    try {
-      movies = await fetchMoviesFromTmdb({
-        usingProxy,
-        apiKey,
-        minFeedSize,
-        suppressedIds,
-        existingMovies: movies
-      });
-      usedTmdbFallback = true;
-    } catch (err) {
-      if (!movies.length) {
-        throw err;
-      }
-      console.warn('TMDB fallback failed but cached movies are available', err);
-      usedTmdbFallback = false;
-    }
+  const combinedExclude = new Set(suppressedIds);
+  if (excludeIds && excludeIds.size) {
+    excludeIds.forEach(id => combinedExclude.add(String(id)));
   }
+
+  const cacheResult = await tryFetchCachedMovies({
+    suppressedIds,
+    excludeIds: combinedExclude
+  });
+  const movies = Array.isArray(cacheResult?.movies) ? cacheResult.movies : [];
+  const metadata = cacheResult?.metadata || null;
 
   return {
     movies,
     genres: cacheResult?.genres || null,
     credits: cacheResult?.credits || null,
     metadata,
-    usedTmdbFallback,
+    usedTmdbFallback: false,
     fromCache: Boolean(cacheResult?.movies?.length)
   };
 }
@@ -3586,149 +4343,221 @@ async function fetchMovies({ usingProxy, apiKey, minFeedSize = MIN_FEED_RESULTS 
 async function fetchGenreMapFromProxy() {
   try {
     const data = await callTmdbProxy('genres', { language: 'en-US' });
-    return Object.fromEntries((data.genres || []).map(g => [g.id, g.name]));
+    const map = Object.fromEntries((data.genres || []).map(g => [g.id, g.name]));
+    storeCachedGenreMap(map);
+    return map;
   } catch (_) {
     return {};
   }
 }
 
-async function loadMovies({ attemptStart } = {}) {
+function setFindNewButtonState(isLoading) {
+  const button = domRefs.findNewButton;
+  if (!button) return;
+  button.disabled = Boolean(isLoading);
+  button.setAttribute('aria-busy', isLoading ? 'true' : 'false');
+  button.textContent = isLoading ? 'Checking for New Movies...' : 'Find New Movies';
+}
+
+async function findNewMovies() {
+  if (findNewInProgress) return;
   const listEl = domRefs.list;
   if (!listEl) return;
 
-  const proxyEndpoint = getTmdbProxyEndpoint();
-  const usingProxy = Boolean(proxyEndpoint);
+  findNewInProgress = true;
+  setFindNewButtonState(true);
+  updateFeedStatus('Checking TMDB for newly released movies...', {
+    tone: 'info',
+    showSpinner: true,
+    location: 'bottom'
+  });
 
-  const inputKey = domRefs.apiKeyInput?.value.trim();
-  let apiKey = activeApiKey || inputKey;
-  let usingTestFallback = false;
+  const usingProxy = Boolean(getTmdbProxyEndpoint());
+  const apiKey = resolveApiKey();
+  const canFetchCredits = usingProxy || Boolean(apiKey);
 
-  if (!apiKey && typeof window !== 'undefined' && window.tmdbApiKey) {
-    apiKey = window.tmdbApiKey;
-  }
-
-  // Allow automated tests to exercise the flow without a real TMDB key.
-  const inVitest =
-    typeof process !== 'undefined' &&
-    process.env &&
-    (process.env.VITEST === 'true' || process.env.NODE_ENV === 'test');
-
-  if (!apiKey && inVitest && !usingProxy) {
-    apiKey = '__TEST_FALLBACK_API_KEY__';
-    usingTestFallback = true;
-  }
-
-  if (!usingProxy && !apiKey) {
-    listEl.innerHTML = '<em>TMDB API key unavailable.</em>';
-    updateFeedStatus(
-      'TMDB API key unavailable. Configure the server secret or enable the proxy to load movies.',
-      {
-        tone: 'warning'
-      }
-    );
-    return;
-  }
-
-  if (!usingProxy && !activeApiKey) {
-    if (usingTestFallback) {
-      activeApiKey = apiKey;
-    } else if (apiKey) {
-      persistApiKey(apiKey);
+  try {
+    const params = new URLSearchParams();
+    params.set('freshOnly', '1');
+    params.set('limit', String(NEW_MOVIE_FETCH_LIMIT));
+    const minRating = getFilterFloat(feedFilterState.minRating, 0, 10);
+    if (Number.isFinite(minRating)) {
+      params.set('minScore', String(minRating));
     }
-  }
 
-  const attemptNumber = ++loadAttemptCounter;
-  const startedLabel = formatTimestamp(
-    Number.isFinite(attemptStart) ? attemptStart : Date.now()
-  );
-  const sourceLabel = usingProxy ? 'TMDB proxy service' : 'direct TMDB API';
-  const attemptIntro = usingProxy
-    ? 'Checking the movie cache before reaching out to the TMDB proxy service with your saved preferences.'
-    : 'Checking the movie cache before contacting TMDB directly using the server TMDB API key.';
-  const fallbackNote = usingProxy
-    ? ' If this route fails we will automatically switch to the server TMDB API key.'
-    : '';
+    const url = `${buildMoviesApiUrl('/api/movies')}?${params.toString()}`;
+    const res = await fetch(url);
+    if (!res.ok) {
+      throw new Error(`Request failed: ${res.status}`);
+    }
+    const data = await res.json();
+    const metadata =
+      data && typeof data === 'object' && data.metadata && typeof data.metadata === 'object'
+        ? data.metadata
+        : null;
+    if (metadata) {
+      lastCatalogMetadata = metadata;
+    }
+
+    if (metadata?.freshError === 'credentials missing') {
+      updateFeedStatus(
+        'New movie check is unavailable because TMDB credentials are not configured on the server.',
+        { tone: 'warning' }
+      );
+      return;
+    }
+
+    const prefetchedCredits = normalizeCreditsMap(data?.credits);
+    const freshMovies = collectMoviesFromCache(data?.results, new Set());
+    if (!freshMovies.length) {
+      updateFeedStatus('No new movies were found right now.', { tone: 'warning' });
+      return;
+    }
+
+    const existingIds = new Set(
+      (Array.isArray(currentMovies) ? currentMovies : [])
+        .map(movie => (movie && movie.id != null ? String(movie.id) : ''))
+        .filter(Boolean)
+    );
+    const newMovies = freshMovies.filter(movie => !existingIds.has(String(movie.id)));
+    if (!newMovies.length) {
+      updateFeedStatus('No unseen new movies were found right now.', { tone: 'warning' });
+      return;
+    }
+
+    try {
+      await enrichMoviesWithCredits(newMovies, {
+        usingProxy,
+        apiKey,
+        prefetchedCredits,
+        skipFetch: !canFetchCredits
+      });
+    } catch (err) {
+      console.warn('Failed to enrich newly discovered movies with credits', err);
+    }
+
+    currentMovies = mergeRestoredMovies([...(Array.isArray(currentMovies) ? currentMovies : []), ...newMovies]);
+    pruneSuppressedMovies();
+
+    const fetchedGenres = normalizeGenreMap(data?.genres ?? data?.genreMap);
+    if (fetchedGenres && Object.keys(fetchedGenres).length) {
+      genreMap = { ...genreMap, ...fetchedGenres };
+      storeCachedGenreMap(genreMap);
+    }
+
+    populateFeedGenreOptions();
+    updateFeedFilterInputsFromState();
+    refreshUI();
+
+    const visibleMatches = applyFeedFilters(getFeedMovies(currentMovies)).length;
+    if (visibleMatches > 0) {
+      updateFeedStatus(
+        `Added ${newMovies.length} new movie${newMovies.length === 1 ? '' : 's'}. ${visibleMatches} ${visibleMatches === 1 ? 'movie matches' : 'movies match'} your current filters.`,
+        { tone: 'success' }
+      );
+    } else {
+      updateFeedStatus(
+        `Added ${newMovies.length} new movie${newMovies.length === 1 ? '' : 's'}, but none match your current filters yet.`,
+        { tone: 'warning' }
+      );
+    }
+  } catch (err) {
+    console.error('Failed to fetch new movies', err);
+    updateFeedStatus(
+      `Could not check for new movies (${summarizeError(err)}).`,
+      { tone: 'error' }
+    );
+  } finally {
+    findNewInProgress = false;
+    setFindNewButtonState(false);
+    updateFeedStatus('', { location: 'bottom' });
+  }
+}
+
+async function loadMovies() {
+  const listEl = domRefs.list;
+  if (!listEl) return;
+
+  const startedLabel = formatTimestamp(Date.now());
   updateFeedStatus(
-    `Loading movies (attempt ${attemptNumber})${
-      startedLabel ? ` started at ${startedLabel}` : ''
-    }. ${attemptIntro}${fallbackNote}`,
-    { tone: 'info', showSpinner: true }
+    `Loading movies from the catalog${startedLabel ? ` (started at ${startedLabel})` : ''}.`,
+    { tone: 'info', showSpinner: true, location: 'bottom' }
   );
 
   listEl.innerHTML = '<em>Loading...</em>';
+
+  const usingProxy = Boolean(getTmdbProxyEndpoint());
+  const apiKey = resolveApiKey();
+  const canFetchCredits = usingProxy || Boolean(apiKey);
+
   try {
     const {
       movies,
       genres: cachedGenreMap,
       credits: prefetchedCredits,
       metadata: catalogMetadata,
-      usedTmdbFallback,
-      fromCache
-    } = await fetchMovies({ usingProxy, apiKey, minFeedSize: MIN_FEED_RESULTS });
-    await enrichMoviesWithCredits(movies, {
-      usingProxy,
-      apiKey,
-      prefetchedCredits
-    });
+      usedTmdbFallback
+    } = await fetchMovies();
+
+    try {
+      await enrichMoviesWithCredits(movies, {
+        usingProxy,
+        apiKey,
+        prefetchedCredits,
+        skipFetch: !canFetchCredits
+      });
+    } catch (err) {
+      console.warn('Failed to enrich catalog movies with credits', err);
+    }
+
     let genres = cachedGenreMap;
     const needsGenreFetch =
-      !genres || !Object.keys(genres).length || usedTmdbFallback;
+      canFetchCredits && (!genres || !Object.keys(genres).length || usedTmdbFallback);
     if (needsGenreFetch) {
-      genres = usingProxy ? await fetchGenreMapFromProxy() : await fetchGenreMapDirect(apiKey);
+      try {
+        genres = usingProxy ? await fetchGenreMapFromProxy() : await fetchGenreMapDirect(apiKey);
+      } catch (err) {
+        console.warn('Failed to load genre metadata', err);
+      }
     }
-    const fetchedMovies = Array.isArray(movies) ? movies : [];
-    currentMovies = mergeRestoredMovies(fetchedMovies);
+
+    if (!genres || !Object.keys(genres).length) {
+      genres = loadCachedGenreMap() || FALLBACK_GENRE_MAP;
+    } else {
+      storeCachedGenreMap(genres);
+    }
+
+    currentMovies = mergeRestoredMovies(Array.isArray(movies) ? movies : []);
+    pruneSuppressedMovies();
     genreMap = genres || {};
     if (catalogMetadata && typeof catalogMetadata === 'object') {
       lastCatalogMetadata = catalogMetadata;
     }
+
     populateFeedGenreOptions();
     updateFeedFilterInputsFromState();
-    feedExhausted = !currentMovies.length;
     refreshUI();
-    const availableCount = getFeedMovies(currentMovies).length;
-    const completedLabel = formatTimestamp(Date.now());
-    const finalSourceLabel = !usedTmdbFallback && fromCache
-      ? 'the movie cache'
-      : `the ${sourceLabel}`;
-    updateFeedStatus(
-      `Loaded ${movies.length} movie${movies.length === 1 ? '' : 's'} on attempt ${attemptNumber}${
-        completedLabel ? ` at ${completedLabel}` : ''
-      } using ${finalSourceLabel}. ${availableCount} ${
-        availableCount === 1 ? 'match' : 'matches'
-      } your current filters.`,
-      { tone: availableCount ? 'success' : 'warning' }
-    );
-  } catch (err) {
-    if (usingProxy) {
-      console.warn('TMDB proxy unavailable, falling back to direct API', err);
+
+    const visibleMatches = applyFeedFilters(getFeedMovies(currentMovies)).length;
+    if (!currentMovies.length) {
+      updateFeedStatus('No saved movies found.', { tone: 'warning', location: 'top' });
+    } else if (visibleMatches > 0) {
       updateFeedStatus(
-        `Attempt ${attemptNumber} using the TMDB proxy service failed (${summarizeProxyError(
-          err
-        )}). Switching to the server TMDB API key.`,
-        { tone: 'warning' }
+        buildCatalogLoadStatusMessage(currentMovies.length, visibleMatches),
+        { tone: 'success' }
       );
-      disableTmdbProxy();
-      if (!apiKey) {
-        listEl.innerHTML =
-          '<em>TMDB proxy is unavailable and no server TMDB API key is configured.</em>';
-        updateFeedStatus(
-          'TMDB proxy is unavailable and no TMDB API key is configured on the server. Contact an administrator to restore access.',
-          { tone: 'error' }
-        );
-        return;
-      }
-      await loadMovies();
-      return;
+    } else {
+      updateFeedStatus('', { location: 'top' });
     }
+  } catch (err) {
     console.error('Failed to load movies', err);
     listEl.textContent = 'Failed to load movies.';
     updateFeedStatus(
-      `Attempt ${attemptNumber} using the ${sourceLabel} failed (${summarizeError(
-        err
-      )}). No movies were loaded. Check the TMDB API configuration and try again.`,
+      `Could not load movies from the catalog (${summarizeError(err)}).`,
       { tone: 'error' }
     );
+  } finally {
+    updateFeedStatus('', { location: 'bottom' });
   }
 }
 
@@ -3750,22 +4579,27 @@ export async function initMoviesPanel() {
   domRefs.watchedList = doc.getElementById('watchedMoviesList');
   domRefs.apiKeyInput = doc.getElementById('moviesApiKey');
   domRefs.apiKeyContainer = doc.getElementById('moviesApiKeyContainer');
+  domRefs.apiKeyStatus = doc.getElementById('moviesApiKeyStatus');
   domRefs.tabs = doc.getElementById('movieTabs');
   domRefs.streamSection = doc.getElementById('movieStreamSection');
   domRefs.interestedSection = doc.getElementById('savedMoviesSection');
   domRefs.watchedSection = doc.getElementById('watchedMoviesSection');
   domRefs.watchedSort = doc.getElementById('watchedMoviesSort');
   domRefs.feedControls = doc.getElementById('movieFeedControls');
+  domRefs.findNewButton = doc.getElementById('movieFindNewButton');
   domRefs.feedStatus = doc.getElementById('movieStatus');
+  domRefs.feedStatusBottom = doc.getElementById('movieStatusBottom');
   domRefs.feedMinRating = doc.getElementById('movieFilterMinRating');
   domRefs.feedMinVotes = doc.getElementById('movieFilterMinVotes');
   domRefs.feedStartYear = doc.getElementById('movieFilterStartYear');
   domRefs.feedEndYear = doc.getElementById('movieFilterEndYear');
   domRefs.feedGenre = doc.getElementById('movieFilterGenre');
+  domRefs.unclassifiedCount = doc.getElementById('movieUnclassifiedCount');
+  domRefs.ratingDistributionToggle = doc.getElementById('movieRatingToggle');
+  domRefs.ratingDistributionPanel = doc.getElementById('movieRatingPanel');
+  domRefs.ratingDistributionList = doc.getElementById('movieRatingList');
 
   updateMovieStats();
-
-  loadAttemptCounter = 0;
 
   currentPrefs = await loadPreferences();
 
@@ -3777,11 +4611,23 @@ export async function initMoviesPanel() {
   attachFeedFilterInput(domRefs.feedStartYear, 'startYear');
   attachFeedFilterInput(domRefs.feedEndYear, 'endYear');
 
+  if (domRefs.findNewButton) {
+    if (!handlers.handleFindNewClick) {
+      handlers.handleFindNewClick = () => {
+        findNewMovies();
+      };
+    }
+    domRefs.findNewButton.removeEventListener('click', handlers.handleFindNewClick);
+    domRefs.findNewButton.addEventListener('click', handlers.handleFindNewClick);
+    setFindNewButtonState(findNewInProgress);
+  }
+
   const storedKey =
     (typeof window !== 'undefined' && window.tmdbApiKey) ||
     (typeof localStorage !== 'undefined' && localStorage.getItem(API_KEY_STORAGE)) ||
     '';
   activeApiKey = storedKey || '';
+  updateApiKeyStatus(activeApiKey);
   if (domRefs.apiKeyInput && storedKey) {
     domRefs.apiKeyInput.value = storedKey;
     if (domRefs.apiKeyContainer) domRefs.apiKeyContainer.style.display = 'none';
@@ -3811,6 +4657,14 @@ export async function initMoviesPanel() {
 
   if (domRefs.apiKeyContainer && getTmdbProxyEndpoint()) {
     domRefs.apiKeyContainer.style.display = 'none';
+  }
+
+  if (domRefs.ratingDistributionToggle) {
+    domRefs.ratingDistributionToggle.removeEventListener(
+      'click',
+      handleRatingDistributionToggle
+    );
+    domRefs.ratingDistributionToggle.addEventListener('click', handleRatingDistributionToggle);
   }
 
   if (domRefs.tabs) {
@@ -3870,6 +4724,40 @@ export async function initMoviesPanel() {
   await loadMovies();
 }
 
+export async function refreshMoviesPanelForAuthChange(user = null) {
+  if (!domRefs.list) {
+    await initMoviesPanel();
+    return;
+  }
+  const nextKey = user?.uid || 'anonymous';
+  const currentKey = prefsLoadedFor || null;
+  if (currentKey === nextKey) {
+    return;
+  }
+
+  loadingPrefsPromise = null;
+  prefsLoadedFor = null;
+  activeUserId = null;
+  serverMovieStats = null;
+  pendingMovieStatsPromise = null;
+  lastFetchedMovieStatsSignature = null;
+  ratingDistributionData = null;
+  pendingRatingDistributionPromise = null;
+  lastRenderedFilterSignature = '';
+  lastRenderedMovieIds = [];
+
+  updateFeedStatus(
+    user
+      ? 'Sign-in complete. Loading your saved movies and preferences...'
+      : 'Signed out. Loading your local movie preferences...',
+    { tone: 'info', showSpinner: true }
+  );
+
+  currentPrefs = await loadPreferences();
+  await loadMovies();
+}
+
 if (typeof window !== 'undefined') {
   window.initMoviesPanel = initMoviesPanel;
+  window.refreshMoviesPanelForAuthChange = refreshMoviesPanelForAuthChange;
 }

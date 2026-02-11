@@ -1,5 +1,4 @@
 import { getCurrentUser, auth, db, awaitAuthUser } from './auth.js';
-import { SAMPLE_DECISIONS, SAMPLE_LISTS } from './sampleData.js';
 import {
   getDecisionsCache,
   setDecisionsCache,
@@ -11,83 +10,13 @@ import {
 
 export { clearDecisionsCache, clearGoalOrderCache } from './cache.js';
 
-// Demo data for visitors stored in sampleData.js
 
-function shiftSampleCalendarItems(items) {
-  const today = new Date();
-  const scheduled = items.filter(it => it.scheduled);
-  if (!scheduled.length) return items;
-  const dates = scheduled
-    .map(it => new Date(it.scheduled))
-    .filter(d => !isNaN(d));
-  const earliest = dates.sort((a, b) => a - b)[0];
-  if (!earliest || earliest >= today) return items;
-  const shiftDays = Math.ceil((today - earliest) / 86400000) + 7;
-  return items.map(it => {
-    if (!it.scheduled) return it;
-    const start = new Date(it.scheduled);
-    if (isNaN(start)) return it;
-    start.setDate(start.getDate() + shiftDays);
-    const updated = { ...it, scheduled: start.toISOString().split('T')[0] };
-    if (it.scheduledEnd) {
-      const end = new Date(it.scheduledEnd);
-      if (!isNaN(end)) {
-        end.setDate(end.getDate() + shiftDays);
-        updated.scheduledEnd = end.toISOString().split('T')[0];
-      }
-    }
-    return updated;
-  });
-}
 
-function stripScheduleFields(list) {
-  return list.map(({ scheduled, scheduledEnd, ...rest }) => rest);
-}
 
-const SAMPLE_SIGNATURE = JSON.stringify(stripScheduleFields(SAMPLE_DECISIONS));
-const SAMPLE_LISTS_SIGNATURE = JSON.stringify(SAMPLE_LISTS);
+
 const DECISIONS_ENABLED = true;
 
-// IDs used in sample/demo data that should never be persisted
-const DEMO_IDS = new Set([
-  'daily-task-1',
-  'daily-task-2',
-  'daily-task-3',
-  'daily-task-4',
-  'daily-task-5',
-  'daily-task-6',
-  'daily-task-7',
-  'daily-task-8',
-  'daily-task-9',
-  'daily-task-10',
-  'daily-task-11',
-  'sample-decision-1'
-]);
 
-export function containsDemoItems(items) {
-  if (!Array.isArray(items)) return false;
-  return items.some(it => {
-    const id = it && it.id;
-    return typeof id === 'string' && (id.startsWith('demo-') || DEMO_IDS.has(id));
-  });
-}
-
-function stripDemoItems(items) {
-  if (!Array.isArray(items)) return items;
-  return items.filter(it => {
-    const id = it && it.id;
-    return !(typeof id === 'string' && (id.startsWith('demo-') || DEMO_IDS.has(id)));
-  });
-}
-
-function isSampleDataset(items) {
-  if (!Array.isArray(items) || items.length !== SAMPLE_DECISIONS.length) return false;
-  try {
-    return JSON.stringify(stripScheduleFields(items)) === SAMPLE_SIGNATURE;
-  } catch {
-    return false;
-  }
-}
 
 export function dedupeById(list) {
   if (!Array.isArray(list)) return [];
@@ -201,25 +130,8 @@ export async function loadDecisions(forceRefresh = false) {
   }
 
   if (!currentUser) {
-    const shifted = shiftSampleCalendarItems(SAMPLE_DECISIONS);
-    const sessionId = getSampleSessionId();
-    try {
-      const snap = await db.collection('sample').doc(sessionId).get();
-      const data = snap.data();
-      const items = Array.isArray(data?.items) ? dedupeDecisions(data.items) : null;
-      if (items && items.length) {
-        const merged = dedupeDecisions([...items, ...shifted]);
-        setDecisionsCache(merged);
-        notifyDecisionsUpdated();
-        return merged;
-      }
-    } catch (err) {
-      console.warn('Failed to load sample decisions:', err);
-    }
-    console.warn('🚫 No current user — returning sample data');
-    setDecisionsCache(shifted);
-    notifyDecisionsUpdated();
-    return shifted;
+    console.warn('🚫 No current user — no sample data to return');
+    return [];
   }
 
   const snap = await db.collection('decisions').doc(currentUser.uid).get();
@@ -256,10 +168,7 @@ export async function loadDecisions(forceRefresh = false) {
     }
   }
 
-  if (isSampleDataset(items)) {
-    console.warn('⚠️ Ignoring sample decisions fetched from Firestore');
-    items = [];
-  }
+
 
   setDecisionsCache(items);
   notifyDecisionsUpdated();
@@ -310,23 +219,12 @@ export async function saveDecisions(items, { skipNotify = false } = {}) {
     console.warn('⚠️ Refusing to save empty or invalid decisions');
     return;
   }
-  if (containsDemoItems(items)) {
-    items = stripDemoItems(items);
-    if (!items.length) return;
-  }
 
-  if (isSampleDataset(items)) return;
 
   setDecisionsCache(items);
   if (!skipNotify) notifyDecisionsUpdated();
   const user = getCurrentUser();
   if (!user) {
-    const sessionId = getSampleSessionId();
-    try {
-      await db.collection('sample').doc(sessionId).set({ items }, { merge: true });
-    } catch (err) {
-      console.warn('Failed to save sample decisions:', err);
-    }
     console.warn('🛑 Cannot save decisions: no authenticated user');
     alert('⚠️ Please sign in to save your changes.');
     return;
@@ -362,20 +260,7 @@ export async function flushPendingDecisions() {
     return;
   }
   let items = getDecisionsCache();
-  if (containsDemoItems(items)) {
-    items = stripDemoItems(items);
-    if (!items.length) {
-      clearTimeout(saveTimer);
-      saveTimer = null;
-      return;
-    }
-    setDecisionsCache(items);
-  }
-  if (isSampleDataset(items)) {
-    clearTimeout(saveTimer);
-    saveTimer = null;
-    return;
-  }
+
   clearTimeout(saveTimer);
   saveTimer = null;
   try {
@@ -416,17 +301,11 @@ export async function restoreBackup(selectFn) {
     alert('Invalid backup data');
     return null;
   }
-  if (!Array.isArray(items) || items.length === 0 || isSampleDataset(items)) {
-    alert('⚠️ Refusing to restore empty or demo backup.');
+  if (!Array.isArray(items) || items.length === 0) {
+    alert('⚠️ Refusing to restore empty backup.');
     return null;
   }
-  if (containsDemoItems(items)) {
-    items = stripDemoItems(items);
-    if (!items.length) {
-      alert('⚠️ Refusing to restore empty or demo backup.');
-      return null;
-    }
-  }
+
   const dateStr = chosen.replace('backup-', '');
   const sizeKb = (JSON.stringify(items).length / 1024).toFixed(1);
   const msg = `Restore backup from ${dateStr} containing ${items.length} item${
@@ -530,7 +409,7 @@ export async function loadLists() {
     if (Array.isArray(stored) && stored.length) {
       return stored; // anonymous → localStorage
     }
-    return SAMPLE_LISTS.slice();
+    return [];
   }
 
   const doc = await db.collection('lists').doc(user.uid).get();
@@ -550,10 +429,7 @@ export async function saveLists(lists) {
     localStorage.setItem(LISTS_KEY, JSON.stringify(sanitized));
     return;
   }
-  if (JSON.stringify(sanitized) === SAMPLE_LISTS_SIGNATURE) {
-    console.warn('⚠️ Refusing to save sample lists');
-    return;
-  }
+
   await db.collection('lists')
           .doc(user.uid)
           .set({ lists: sanitized }, { merge: true });

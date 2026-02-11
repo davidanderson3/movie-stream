@@ -1,7 +1,13 @@
-const { getFirestore, serverTimestamp } = require('./firestore');
+const { getFirestore, serverTimestamp, getFirestoreStatus } = require('./firestore');
 
 const MAX_IN_MEMORY_CACHE_ENTRIES = 500;
 const inMemoryCache = new Map();
+const REQUIRE_FIRESTORE = (() => {
+  const raw = process.env.CACHE_REQUIRE_FIRESTORE ?? process.env.FIRESTORE_REQUIRED;
+  if (raw === undefined || raw === null) return false;
+  const normalized = String(raw).trim().toLowerCase();
+  return ['1', 'true', 'yes', 'on'].includes(normalized);
+})();
 
 function serializePart(part) {
   if (part === null || part === undefined) return '';
@@ -35,6 +41,7 @@ function buildCacheId(parts) {
 }
 
 function rememberInMemory(docId, payload, fetchedAt = Date.now()) {
+  if (REQUIRE_FIRESTORE) return;
   if (!docId || !payload || typeof payload.body !== 'string' || !payload.body.length) {
     return;
   }
@@ -58,6 +65,7 @@ function rememberInMemory(docId, payload, fetchedAt = Date.now()) {
 }
 
 function readInMemoryCache(docId, ttlMs) {
+  if (REQUIRE_FIRESTORE) return null;
   if (!docId) return null;
   const entry = inMemoryCache.get(docId);
   if (!entry) return null;
@@ -77,21 +85,26 @@ async function readCachedResponse(collection, parts, ttlMs) {
   const db = getFirestore();
   const docId = buildCacheId(parts);
   if (!db) {
+    if (REQUIRE_FIRESTORE) {
+      return null;
+    }
     return readInMemoryCache(docId, ttlMs);
   }
   try {
     const snap = await db.collection(collection).doc(docId).get();
-    if (!snap.exists) return readInMemoryCache(docId, ttlMs);
-    const data = snap.data() || {};
-    const fetchedAt = data.fetchedAt;
-    const fetchedMs =
-      fetchedAt && typeof fetchedAt.toMillis === 'function' ? fetchedAt.toMillis() : null;
-    if (!fetchedMs) return readInMemoryCache(docId, ttlMs);
-    if (typeof ttlMs === 'number' && ttlMs > 0 && Date.now() - fetchedMs > ttlMs) {
-      inMemoryCache.delete(docId);
-      return null;
+    if (!snap.exists) {
+      if (REQUIRE_FIRESTORE) {
+        return null;
+      }
+      return readInMemoryCache(docId, ttlMs);
     }
-    if (typeof data.body !== 'string' || !data.body) return readInMemoryCache(docId, ttlMs);
+    const data = snap.data() || {};
+    if (typeof data.body !== 'string' || !data.body) {
+      if (REQUIRE_FIRESTORE) {
+        return null;
+      }
+      return readInMemoryCache(docId, ttlMs);
+    }
     const payload = {
       status: typeof data.status === 'number' ? data.status : 200,
       contentType:
@@ -101,10 +114,30 @@ async function readCachedResponse(collection, parts, ttlMs) {
       body: data.body,
       metadata: data.metadata || null
     };
+    const fetchedAt = data.fetchedAt;
+    const fetchedMs =
+      fetchedAt && typeof fetchedAt.toMillis === 'function' ? fetchedAt.toMillis() : null;
+    if (!fetchedMs) {
+      if (typeof ttlMs === 'number' && ttlMs > 0) {
+        if (REQUIRE_FIRESTORE) {
+          return null;
+        }
+        return readInMemoryCache(docId, ttlMs);
+      }
+      rememberInMemory(docId, payload);
+      return payload;
+    }
+    if (typeof ttlMs === 'number' && ttlMs > 0 && Date.now() - fetchedMs > ttlMs) {
+      inMemoryCache.delete(docId);
+      return null;
+    }
     rememberInMemory(docId, payload, fetchedMs);
     return payload;
   } catch (err) {
     console.error(`Failed to read cache entry ${collection}/${docId}`, err);
+    if (REQUIRE_FIRESTORE) {
+      return null;
+    }
     return readInMemoryCache(docId, ttlMs);
   }
 }
@@ -128,7 +161,15 @@ async function writeCachedResponse(collection, parts, payload = {}) {
   };
   rememberInMemory(docId, normalizedPayload);
   const db = getFirestore();
-  if (!db) return;
+  if (!db) {
+    if (REQUIRE_FIRESTORE) {
+      console.error(
+        `Cache write skipped for ${collection}/${docId}: Firestore is required but unavailable.`,
+        getFirestoreStatus()
+      );
+    }
+    return;
+  }
   try {
     await db
       .collection(collection)
@@ -146,9 +187,62 @@ async function writeCachedResponse(collection, parts, payload = {}) {
   }
 }
 
+async function probeFirestoreWrite() {
+  const db = getFirestore();
+  if (!db) {
+    return {
+      ok: false,
+      reason: 'firestore_unavailable'
+    };
+  }
+
+  const probeTimeoutMs = Math.max(
+    1000,
+    Number(process.env.FIRESTORE_PROBE_TIMEOUT_MS) || 5000
+  );
+  const withTimeout = promise =>
+    Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('firestore_probe_timeout')), probeTimeoutMs);
+      })
+    ]);
+
+  const id = `cache-probe-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const ref = db.collection('_cacheHealth').doc(id);
+  try {
+    await withTimeout(ref.set({
+      source: 'cache-probe',
+      createdAt: serverTimestamp()
+    }));
+    await withTimeout(ref.delete());
+    return { ok: true };
+  } catch (err) {
+    try {
+      await withTimeout(ref.delete());
+    } catch (_) {
+      // Ignore cleanup failures for probe docs.
+    }
+    return {
+      ok: false,
+      reason: 'firestore_write_failed',
+      error: String(err?.message || err)
+    };
+  }
+}
+
+function getCacheBackendStatus() {
+  return {
+    requireFirestore: REQUIRE_FIRESTORE,
+    firestore: getFirestoreStatus()
+  };
+}
+
 module.exports = {
   buildCacheId,
   readCachedResponse,
   writeCachedResponse,
-  serializePart
+  probeFirestoreWrite,
+  serializePart,
+  getCacheBackendStatus
 };

@@ -18,7 +18,6 @@ vi.mock('../js/auth.js', () => ({ initAuth: vi.fn(), db: {}, currentUser: null, 
 vi.mock('../js/wizard.js', () => ({ initWizard: vi.fn() }));
 vi.mock('../js/report.js', () => ({ renderDailyTaskReport: vi.fn() }));
 vi.mock('../js/stats.js', () => ({ initMetricsUI: vi.fn() }));
-vi.mock('../js/tabs.js', () => ({ initTabs: vi.fn() }));
 vi.mock('../js/buttonStyles.js', () => ({ initButtonStyles: vi.fn() }));
 vi.mock('../js/tabReports.js', () => ({ initTabReports: vi.fn() }));
 vi.mock('../js/settings.js', () => ({ loadHiddenTabs: vi.fn(), applyHiddenTabs: vi.fn() }));
@@ -325,5 +324,51 @@ describe('beforeunload handler', () => {
     dom.window.dispatchEvent(new dom.window.Event('DOMContentLoaded'));
     dom.window.dispatchEvent(new dom.window.Event('beforeunload'));
     expect(helpers.flushPendingDecisions).toHaveBeenCalled();
+  });
+});
+
+describe('movies auth sync', () => {
+  beforeEach(() => {
+    vi.resetModules();
+  });
+
+  it('avoids redundant movies refresh when initial auth emits duplicate signed-in state', async () => {
+    const initMoviesPanel = vi.fn(() => new Promise(resolve => setTimeout(resolve, 0)));
+    const refreshMoviesPanelForAuthChange = vi.fn().mockResolvedValue();
+    vi.doMock('../js/movies.js', () => ({
+      initMoviesPanel,
+      refreshMoviesPanelForAuthChange
+    }));
+
+    const dom = new JSDOM(`
+      <button id="signupBtn"></button>
+      <button id="loginBtn"></button>
+      <div id="goalsView"></div>
+      <div id="tabsContainer"></div>
+      <div id="moviesPanel"></div>
+    `);
+    global.window = dom.window;
+    global.document = dom.window.document;
+    global.firebase = { auth: () => ({ currentUser: null }) };
+
+    const settings = await import('../js/settings.js');
+    settings.loadHiddenTabs.mockResolvedValue({});
+    settings.applyHiddenTabs.mockImplementation(() => {});
+
+    const auth = await import('../js/auth.js');
+    auth.initAuth.mockImplementation(async (_ui, cb) => {
+      const user = { uid: 'duplicate-user' };
+      const first = cb(user);
+      const second = cb(user);
+      await Promise.all([first, second]);
+    });
+
+    await import('../js/main.js');
+    dom.window.dispatchEvent(new dom.window.Event('DOMContentLoaded'));
+    await new Promise(resolve => setTimeout(resolve, 0));
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(initMoviesPanel).toHaveBeenCalledTimes(1);
+    expect(refreshMoviesPanelForAuthChange).not.toHaveBeenCalled();
   });
 });

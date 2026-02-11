@@ -32,7 +32,7 @@
     <!-- MOVIES PANEL -->
 
     <!-- MOVIES PANEL -->
-      <div id="moviesPanel" class="main-layout" style="display:none">
+      <div id="moviesPanel" class="main-layout">
         <div class="full-column">
         <header class="movies-panel-header">
           <h1>Movie Stream</h1>
@@ -45,64 +45,110 @@
         <div id="movieStreamSection">
           <div class="media-stream">
             <aside class="media-stream__filters">
-              <div class="movie-feed-status-row">
-                <div id="movieFeedControls" class="movie-controls movie-filter-controls media-filter-toolbar">
-                  <div class="movie-filter-field movie-filter-genre media-filter-toolbar__item">
-                    <span class="movie-filter-label">Genre</span>
-                    <div id="movieFilterGenre" class="genre-filter"></div>
-                  </div>
-                  <div class="movie-filter-field media-filter-toolbar__item">
-                    <label for="movieFilterMinRating">Min Rating</label>
-                    <input
-                      type="number"
-                      id="movieFilterMinRating"
-                      name="movieFilterMinRating"
-                      min="0"
-                      max="10"
-                      step="0.1"
-                      inputmode="decimal"
-                      placeholder="8"
-                    />
-                  </div>
-                  <div class="movie-filter-field media-filter-toolbar__item">
-                    <label for="movieFilterMinVotes">Min Votes</label>
-                    <input
-                      type="number"
-                      id="movieFilterMinVotes"
-                      name="movieFilterMinVotes"
-                      min="0"
-                      step="1"
-                      inputmode="numeric"
-                      placeholder="e.g. 100"
-                    />
-                  </div>
-                  <div class="movie-filter-field media-filter-toolbar__item">
-                    <label for="movieFilterStartYear">Earliest Year</label>
-                    <input
-                      type="number"
-                      id="movieFilterStartYear"
-                      name="movieFilterStartYear"
-                      inputmode="numeric"
-                      placeholder="e.g. 2010"
-                    />
-                  </div>
-                  <div class="movie-filter-field media-filter-toolbar__item">
-                    <label for="movieFilterEndYear">Latest Year</label>
-                    <input
-                      type="number"
-                      id="movieFilterEndYear"
-                      name="movieFilterEndYear"
-                      inputmode="numeric"
-                      placeholder="e.g. 2024"
-                    />
+                <div class="movie-feed-status-row">
+                  <div id="movieFeedControls" class="movie-controls movie-filter-controls media-filter-toolbar">
+                    <div class="movie-filter-field media-filter-toolbar__item">
+                      <label for="movieFilterMinRating">Min rating</label>
+                      <input
+                        id="movieFilterMinRating"
+                        type="number"
+                        min="0"
+                        max="10"
+                        step="0.1"
+                        inputmode="decimal"
+                        placeholder="0-10"
+                      />
+                    </div>
+                    <div class="movie-filter-field media-filter-toolbar__item">
+                      <label for="movieFilterMinVotes">Min votes</label>
+                      <input
+                        id="movieFilterMinVotes"
+                        type="number"
+                        min="0"
+                        step="1"
+                        inputmode="numeric"
+                        placeholder="e.g. 100"
+                      />
+                    </div>
+                    <div class="movie-filter-field media-filter-toolbar__item">
+                      <label for="movieFilterStartYear">Start year</label>
+                      <input
+                        id="movieFilterStartYear"
+                        type="number"
+                        min="1800"
+                        max="3000"
+                        step="1"
+                        inputmode="numeric"
+                        placeholder="e.g. 1990"
+                      />
+                    </div>
+                    <div class="movie-filter-field media-filter-toolbar__item">
+                      <label for="movieFilterEndYear">End year</label>
+                      <input
+                        id="movieFilterEndYear"
+                        type="number"
+                        min="1800"
+                        max="3000"
+                        step="1"
+                        inputmode="numeric"
+                        placeholder="e.g. 2020"
+                      />
+                    </div>
+                    <div class="movie-filter-field movie-filter-genre media-filter-toolbar__item">
+                      <span class="movie-filter-label">Genre</span>
+                      <div id="movieFilterGenre" class="genre-filter"></div>
+                    </div>
+                    <div class="movie-filter-field media-filter-toolbar__item">
+                      <button
+                        type="button"
+                        id="movieFindNewButton"
+                        class="movie-find-new-btn"
+                      >
+                        Find New Movies
+                      </button>
+                    </div>
+                    <div id="moviesApiKeyContainer" class="movie-filter-field media-filter-toolbar__item">
+                      <label for="moviesApiKey">TMDB API key</label>
+                      <input
+                        id="moviesApiKey"
+                        type="password"
+                        inputmode="text"
+                        autocomplete="off"
+                        placeholder="Paste key"
+                      />
+                    </div>
+                    <div id="moviesApiKeyStatus" class="movie-api-key-status" aria-live="polite"></div>
                   </div>
                 </div>
-                <div id="movieStatus" class="movie-status" aria-live="polite"></div>
-              </div>
-              <div id="movieStats" class="media-stats" aria-live="polite"></div>
+                <div id="movieStats" class="media-stats" aria-live="polite"></div>
+                <div class="movie-rating-distribution">
+                  <button
+                    type="button"
+                    id="movieRatingToggle"
+                    class="movie-rating-distribution__toggle"
+                    aria-expanded="false"
+                  >
+                    Show filtered rating distribution
+                  </button>
+                  <div
+                    id="movieRatingPanel"
+                    class="movie-rating-distribution__panel"
+                    hidden
+                  >
+                    <ul id="movieRatingList" class="movie-rating-distribution__list"></ul>
+                    <p class="movie-rating-distribution__footnote">
+                      Top 5 rating ranges at 0.1 increments from the movie catalog.
+                    </p>
+                  </div>
+                </div>
             </aside>
             <section class="media-stream__content">
+              <div class="movie-stream__status-row">
+                <div id="movieStatus" class="movie-status" aria-live="polite"></div>
+                <div id="movieUnclassifiedCount" class="movie-unclassified-count" aria-live="polite"></div>
+              </div>
               <div id="movieList" class="decision-container"></div>
+              <div id="movieStatusBottom" class="movie-status movie-status--bottom" aria-live="polite"></div>
             </section>
           </div>
         </div>
@@ -129,7 +175,6 @@
   </section>
 
   <nav id="bottomNav" class="bottom-nav">
-    <a href="settings.html" class="icon-btn" id="bottomSettingsBtn"><img src="assets/gear.svg" alt="Settings"></a>
     <button type="button" id="bottomAddBtn" class="icon-btn circle-btn icon-button"><img src="assets/plus.svg" alt="Add" /></button>
     <button type="button" id="bottomLogoutBtn" class="icon-btn"><img src="assets/sign-out.svg" alt="Sign Out" /></button>
   </nav>
@@ -170,7 +215,5 @@
   <script src="https://apis.google.com/js/api.js"></script>
   <script type="module" src="js/main.js"></script>
   <script type="module" src="js/movies.js"></script>
-  <script type="module" src="js/weather.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </body>
 </html>

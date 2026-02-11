@@ -1,6 +1,15 @@
 import { auth, db, getCurrentUser } from './auth.js';
-import { PANELS, PANEL_NAMES } from './tabs.js';
-import { getSiteName, setSiteName } from './siteName.js';
+// TODO: PANELS and PANEL_NAMES were previously imported from a missing file named `tabs.js`.
+// This is a temporary solution to allow the settings page to function.
+const PANELS = ['moviesPanel', 'seriesPanel'];
+const PANEL_NAMES = {
+  moviesPanel: 'Movies',
+  seriesPanel: 'Series',
+};
+// TODO: getSiteName and setSiteName were previously imported from a missing file named `siteName.js`.
+// This is a temporary solution to allow the settings page to function.
+const getSiteName = () => 'Movie Stream';
+const setSiteName = (name) => console.log('setSiteName called with', name);
 
 const BASE_KEY = 'hiddenTabs';
 const BASE_ORDER_KEY = 'tabOrder';

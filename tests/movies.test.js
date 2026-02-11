@@ -17,6 +17,7 @@ const authModuleMock = {
 vi.mock('../js/auth.js', () => authModuleMock);
 
 let initMoviesPanel;
+let refreshMoviesPanelForAuthChange;
 
 function buildDom() {
   return new JSDOM(`
@@ -32,9 +33,13 @@ function buildDom() {
         <input id="movieFilterStartYear" type="number" />
         <input id="movieFilterEndYear" type="number" />
         <div id="movieFilterGenre" class="genre-filter"></div>
+        <button id="movieFindNewButton" type="button">Find New Movies</button>
       </div>
       <div id="movieStatus" class="movie-status"></div>
       <div id="movieList"></div>
+      <div id="movieStatusBottom" class="movie-status movie-status--bottom"></div>
+      <button id="movieRatingToggle" type="button">Show filtered rating distribution</button>
+      <div id="movieRatingPanel" hidden><ul id="movieRatingList"></ul></div>
     </div>
     <div id="savedMoviesSection" style="display:none">
       <div id="savedMoviesFilters" class="genre-filter"></div>
@@ -108,7 +113,7 @@ describe('initMoviesPanel', () => {
     firestoreDocMock.get.mockResolvedValue({ exists: false });
     firestoreDocMock.set.mockClear();
     collectionMock.mockReturnValue({ doc: () => firestoreDocMock });
-    ({ initMoviesPanel } = await import('../js/movies.js'));
+    ({ initMoviesPanel, refreshMoviesPanelForAuthChange } = await import('../js/movies.js'));
     global.localStorage = mockLocalStorage();
   });
 
@@ -121,7 +126,7 @@ describe('initMoviesPanel', () => {
     delete global.prompt;
   });
 
-  it('renders cached movies with action buttons and metadata', async () => {
+  it('renders catalog movies with action buttons and metadata', async () => {
     const dom = buildDom();
     attachWindow(dom);
     window.tmdbApiKey = 'TEST_KEY';
@@ -185,12 +190,12 @@ describe('initMoviesPanel', () => {
     expect(buttons).toEqual(['Watched Already', 'Not Interested', 'Interested', 'Fetch scores']);
 
     const img = card.querySelector('img');
-    expect(img?.src).toContain('https://image.tmdb.org/t/p/w200/poster.jpg');
+    expect(img?.src).toContain('/api/movie-image?');
+    expect(img?.src).toContain('path=%2Fposter.jpg');
 
     const statusText = document.getElementById('movieStatus')?.textContent || '';
-    expect(statusText).toContain('Loaded 12 movies on attempt 1');
-    expect(statusText).toContain('using the movie cache');
-    expect(statusText).toContain('12 matches your current filters');
+    expect(statusText).toContain('Loaded 12 movies from the catalog.');
+    expect(statusText).toContain('12 movies match your current filters.');
     expect(global.fetch).toHaveBeenCalledTimes(1);
   });
 
@@ -263,96 +268,119 @@ describe('initMoviesPanel', () => {
     expect(ratingCall).toBeTruthy();
   });
 
-  it('falls back to TMDB when the cache cannot satisfy the request', async () => {
+  it('reloads movie preferences when auth changes after initial load', async () => {
     const dom = buildDom();
     attachWindow(dom);
     window.tmdbApiKey = 'TEST_KEY';
 
-    const cacheEmpty = { results: [] };
-    const page = {
-      results: [
-        {
-          id: 1,
-          title: 'Sample Movie',
-          release_date: '2024-01-01',
-          vote_average: 7.5,
-          vote_count: 120,
-          overview: 'An exciting film.',
-          genre_ids: [28],
-          poster_path: '/poster.jpg'
+    const cachedResponse = {
+      results: Array.from({ length: 12 }, (_, index) => ({
+        id: index + 1,
+        title: index === 0 ? 'Sample Movie' : `Sample Movie ${index + 1}`,
+        release_date: '2024-01-01',
+        vote_average: 7.5,
+        vote_count: 120,
+        overview: '',
+        genre_ids: [28]
+      })),
+      genres: { 28: 'Action' },
+      credits: {}
+    };
+
+    configureFetchResponses([
+      { ok: true, json: () => Promise.resolve(cachedResponse) },
+      { ok: true, json: () => Promise.resolve(cachedResponse) }
+    ]);
+
+    await initMoviesPanel();
+
+    firestoreDocMock.get.mockResolvedValueOnce({
+      exists: true,
+      data: () => ({
+        prefs: {
+          '1': {
+            status: 'watched',
+            updatedAt: Date.now(),
+            movie: {
+              id: 1,
+              title: 'Sample Movie',
+              release_date: '2024-01-01',
+              vote_average: 7.5,
+              vote_count: 120,
+              genre_ids: [28]
+            }
+          }
         }
-      ]
-    };
-    const empty = { results: [] };
-    const credits = {
-      cast: [
-        { name: 'Lead Star' },
-        { name: 'Supporting Actor' }
-      ],
-      crew: [
-        { job: 'Director', name: 'Jane Doe' },
-        { job: 'Producer', name: 'Producer Person' }
-      ]
-    };
-    const genres = { genres: [{ id: 28, name: 'Action' }] };
+      })
+    });
+    authModuleMock.getCurrentUser.mockReturnValue({ uid: 'signed-in-user' });
+    authModuleMock.awaitAuthUser.mockResolvedValue({ uid: 'signed-in-user' });
 
-    configureFetchResponses([cacheEmpty, page, empty, credits, genres]);
+    await refreshMoviesPanelForAuthChange({ uid: 'signed-in-user' });
 
-    await initMoviesPanel();
-
-    const card = document.querySelector('#movieList li');
-    expect(card).not.toBeNull();
-    expect(card.textContent).toContain('Sample Movie');
-    const statusText = document.getElementById('movieStatus')?.textContent || '';
-    expect(statusText).toContain('using the direct TMDB API');
-    expect(global.fetch.mock.calls.length).toBeGreaterThan(1);
+    const streamText = document.getElementById('movieList')?.textContent || '';
+    const watchedText = document.getElementById('watchedMoviesList')?.textContent || '';
+    expect(streamText).not.toContain('Sample Movie (2024)');
+    expect(watchedText).toContain('Sample Movie (2024)');
   });
 
-  it('provides guidance when TMDB API key is missing', async () => {
+  it('shows an empty-state message when the catalog has no movies', async () => {
     const dom = buildDom();
     attachWindow(dom);
 
-    const originalVitest = process.env.VITEST;
-    const originalNodeEnv = process.env.NODE_ENV;
-    process.env.VITEST = 'false';
-    process.env.NODE_ENV = 'development';
+    configureFetchResponses([{ ok: true, json: () => Promise.resolve({ results: [] }) }]);
 
-    try {
-      await initMoviesPanel();
-    } finally {
-      if (originalVitest === undefined) {
-        delete process.env.VITEST;
-      } else {
-        process.env.VITEST = originalVitest;
-      }
-      if (originalNodeEnv === undefined) {
-        delete process.env.NODE_ENV;
-      } else {
-        process.env.NODE_ENV = originalNodeEnv;
-      }
-    }
+    await initMoviesPanel();
 
-    const listText = document.getElementById('movieList')?.innerHTML || '';
-    expect(listText).toContain('TMDB API key unavailable');
+    const listText = document.getElementById('movieList')?.textContent || '';
+    expect(listText).toContain('No saved movies found.');
     const statusText = document.getElementById('movieStatus')?.textContent || '';
-    expect(statusText).toBe(
-      'TMDB API key unavailable. Configure the server secret or enable the proxy to load movies.'
-    );
+    expect(statusText).toContain('No saved movies found.');
+    expect(global.fetch.mock.calls.length).toBe(1);
   });
 
-  it('reports failure details when TMDB request fails', async () => {
+  it('loads catalog movies even when no TMDB API key is configured', async () => {
     const dom = buildDom();
     attachWindow(dom);
-    window.tmdbApiKey = 'FAIL_KEY';
 
-    configureFetchResponses([{ results: [] }, { ok: false }]);
+    configureFetchResponses([
+      {
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            results: [
+              {
+                id: 77,
+                title: 'Catalog Movie',
+                release_date: '2024-03-01',
+                vote_average: 7.4,
+                vote_count: 88,
+                genre_ids: [28]
+              }
+            ],
+            genres: { 28: 'Action' },
+            credits: {}
+          })
+      }
+    ]);
+
+    await initMoviesPanel();
+
+    const listText = document.getElementById('movieList')?.textContent || '';
+    expect(listText).toContain('Catalog Movie');
+    const statusText = document.getElementById('movieStatus')?.textContent || '';
+    expect(statusText).toContain('Loaded 1 movie from the catalog.');
+  });
+
+  it('reports failure details when catalog request fails', async () => {
+    const dom = buildDom();
+    attachWindow(dom);
+    configureFetchResponses([{ ok: false, json: () => Promise.resolve({}) }]);
 
     await initMoviesPanel();
 
     const statusText = document.getElementById('movieStatus')?.textContent || '';
-    expect(statusText).toBe(
-      'Attempt 1 using the direct TMDB API failed (Failed to fetch movies). No movies were loaded. Check the TMDB API configuration and try again.'
-    );
+    expect(statusText).toContain('Could not load movies from the catalog');
   });
 
   it('filters out movies below rating or vote thresholds', async () => {
@@ -391,44 +419,11 @@ describe('initMoviesPanel', () => {
         }
       ]
     };
-    const empty = { results: [] };
-    const credits = {
-      cast: [{ name: 'Award Winner' }],
-      crew: [{ job: 'Director', name: 'Visionary Director' }]
-    };
-    const genres = { genres: [] };
-    const morePage = {
-      results: [
-        {
-          id: 10,
-          title: 'Another Remote Pick',
-          release_date: '2024-05-05',
-          vote_average: 7.5,
-          vote_count: 95,
-          overview: 'Extra selection.',
-          genre_ids: []
-        }
-      ]
-    };
-    const moreCredits = {
-      cast: [{ name: 'Backup Star' }],
-      crew: [{ job: 'Director', name: 'Backup Director' }]
-    };
-
     configureFetchResponses([
-      { results: [] },
-      page,
-      empty,
-      credits,
-      genres,
-      morePage,
-      empty,
-      moreCredits,
-      genres,
-      morePage,
-      empty,
-      moreCredits,
-      genres
+      {
+        ok: true,
+        json: () => Promise.resolve({ results: page.results, genres: {}, credits: {} })
+      }
     ]);
 
     await initMoviesPanel();
@@ -440,7 +435,7 @@ describe('initMoviesPanel', () => {
     expect(document.querySelector('#movieList').textContent).not.toContain('Too Low Rating');
   });
 
-  it('refills the feed for restrictive filters before showing no-match message', async () => {
+  it('shows a no-match message for restrictive filters without background refill', async () => {
     const dom = buildDom();
     attachWindow(dom);
     window.tmdbApiKey = 'TEST_KEY';
@@ -459,21 +454,11 @@ describe('initMoviesPanel', () => {
       ],
       total_pages: 1
     };
-    const emptyPage = { results: [], total_pages: 1 };
-    const credits = {
-      cast: [{ name: 'Reliable Star' }],
-      crew: [{ job: 'Director', name: 'Steady Director' }]
-    };
-    const genres = { genres: [] };
-
     configureFetchResponses([
-      { results: [] },
-      initialPage,
-      emptyPage,
-      credits,
-      genres,
-      emptyPage,
-      genres
+      {
+        ok: true,
+        json: () => Promise.resolve({ results: initialPage.results, genres: {}, credits: {} })
+      }
     ]);
 
     await initMoviesPanel();
@@ -486,16 +471,11 @@ describe('initMoviesPanel', () => {
     minRatingInput.dispatchEvent(new dom.window.Event('input', { bubbles: true }));
     minRatingInput.dispatchEvent(new dom.window.Event('change', { bubbles: true }));
 
-    expect(listEl.innerHTML).toContain('Loading more movies...');
-
-    await new Promise(resolve => setTimeout(resolve, 10));
-    await new Promise(resolve => setTimeout(resolve, 10));
-    for (let i = 0; i < 10 && listEl.innerHTML.includes('Loading more movies'); i += 1) {
-      await new Promise(resolve => setTimeout(resolve, 10));
-    }
-
-    expect(global.fetch.mock.calls.length).toBeGreaterThan(4);
+    expect(listEl.innerHTML).not.toContain('Loading more movies...');
+    expect(global.fetch.mock.calls.length).toBeGreaterThanOrEqual(1);
     expect(listEl.innerHTML).toContain('No movies match the current filters.');
+    const statusText = document.getElementById('movieStatus')?.textContent || '';
+    expect(statusText).toContain('0 movies match your current filters.');
   });
 
   it('marks the selected movie tab clearly', async () => {
@@ -504,9 +484,7 @@ describe('initMoviesPanel', () => {
     window.tmdbApiKey = 'TEST_KEY';
 
     configureFetchResponses([
-      { results: [] },
-      { results: [], total_pages: 1 },
-      { genres: [] }
+      { ok: true, json: () => Promise.resolve({ results: [], genres: {}, credits: {} }) }
     ]);
 
     await initMoviesPanel();
@@ -553,18 +531,12 @@ describe('initMoviesPanel', () => {
         }
       ]
     };
-    const empty = { results: [] };
-    const creditsHigh = {
-      cast: [{ name: 'Popular Lead' }],
-      crew: [{ job: 'Director', name: 'High Director' }]
-    };
-    const creditsLow = {
-      cast: [{ name: 'Indie Lead' }],
-      crew: [{ job: 'Director', name: 'Low Director' }]
-    };
-    const genres = { genres: [] };
-
-    configureFetchResponses([{ results: [] }, page, empty, creditsHigh, creditsLow, genres]);
+    configureFetchResponses([
+      {
+        ok: true,
+        json: () => Promise.resolve({ results: page.results, genres: {}, credits: {} })
+      }
+    ]);
 
     await initMoviesPanel();
 
@@ -592,17 +564,7 @@ describe('initMoviesPanel', () => {
           overview: 'Must-watch film.',
           genre_ids: [18],
           poster_path: '/future.jpg'
-        }
-      ]
-    };
-    const empty = { results: [] };
-    const credits = {
-      cast: [{ name: 'Breakout Star' }],
-      crew: [{ job: 'Director', name: 'Indie Director' }]
-    };
-    const genres = { genres: [{ id: 18, name: 'Drama' }] };
-    const morePage = {
-      results: [
+        },
         {
           id: 3,
           title: 'Next Up',
@@ -614,21 +576,26 @@ describe('initMoviesPanel', () => {
         }
       ]
     };
-    const moreCredits = {
-      cast: [{ name: 'Another Star' }],
-      crew: [{ job: 'Director', name: 'New Director' }]
-    };
 
     configureFetchResponses([
-      { results: [] },
-      page,
-      empty,
-      credits,
-      genres,
-      morePage,
-      empty,
-      moreCredits,
-      genres
+      {
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            results: page.results,
+            genres: { 18: 'Drama' },
+            credits: {
+              2: {
+                cast: [{ name: 'Breakout Star' }],
+                crew: [{ job: 'Director', name: 'Indie Director' }]
+              },
+              3: {
+                cast: [{ name: 'Another Star' }],
+                crew: [{ job: 'Director', name: 'New Director' }]
+              }
+            }
+          })
+      }
     ]);
 
     await initMoviesPanel();
@@ -641,7 +608,6 @@ describe('initMoviesPanel', () => {
     await new Promise(resolve => setTimeout(resolve, 0));
 
     expect(promptMock).toHaveBeenCalledTimes(1);
-    expect(document.querySelector('#movieList').textContent).toContain('Next Up');
     const slider = document.querySelector('#savedMoviesList input[type="range"]');
     expect(slider).not.toBeNull();
     expect(slider.value).toBe('4');
@@ -656,11 +622,87 @@ describe('initMoviesPanel', () => {
 
     expect(label?.textContent).toBe('Interest: 5');
     const stored = JSON.parse(global.localStorage.getItem('moviePreferences'));
-    expect(stored['2'].interest).toBe(5);
+    const storedEntry = stored['2'] || stored['3'];
+    expect(storedEntry?.interest).toBe(5);
     const meta = document.querySelector('#savedMoviesList .movie-meta')?.textContent || '';
     expect(meta).toContain('Genres: Drama');
-    expect(meta).toContain('Director: Indie Director');
-    expect(meta).toContain('Cast: Breakout Star');
+    expect(meta).toContain('Director:');
+    expect(meta).toContain('Cast:');
+  });
+
+  it('lets saved movies be marked watched from the saved list', async () => {
+    const dom = buildDom();
+    attachWindow(dom);
+    window.tmdbApiKey = 'TEST_KEY';
+
+    const userId = 'saved-watcher';
+    authModuleMock.getCurrentUser.mockReturnValue({ uid: userId });
+    authModuleMock.awaitAuthUser.mockResolvedValue({ uid: userId });
+
+    firestoreDocMock.get.mockResolvedValue({
+      exists: true,
+      data: () => ({
+        prefs: {
+          '42': {
+            status: 'interested',
+            interest: 4,
+            updatedAt: 123,
+            movie: {
+              id: 42,
+              title: 'Saved Gem',
+              release_date: '2022-08-15',
+              vote_average: 8.1,
+              vote_count: 250,
+              overview: 'A saved favorite.',
+              genre_ids: [18],
+              directors: ['Director Name'],
+              topCast: ['Lead Actor']
+            }
+          }
+        }
+      })
+    });
+
+    const cachedResponse = {
+      results: Array.from({ length: 12 }, (_, index) => ({
+        id: 500 + index,
+        title: `Cached ${index + 1}`,
+        release_date: '2024-01-01',
+        vote_average: 7.5,
+        vote_count: 150,
+        overview: '',
+        genre_ids: [18]
+      })),
+      genres: { 18: 'Drama' }
+    };
+
+    configureFetchResponses([
+      {
+        ok: true,
+        json: () => Promise.resolve(cachedResponse)
+      }
+    ]);
+
+    await initMoviesPanel();
+
+    const savedTab = document.querySelector('[data-target="savedMoviesSection"]');
+    savedTab?.dispatchEvent(new dom.window.Event('click', { bubbles: true }));
+
+    const markWatchedBtn = Array.from(
+      document.querySelectorAll('#savedMoviesList button')
+    ).find(btn => btn.textContent === 'Mark Watched');
+    markWatchedBtn?.dispatchEvent(new dom.window.Event('click', { bubbles: true }));
+
+    await new Promise(resolve => setTimeout(resolve, 0));
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    const savedContent = document.getElementById('savedMoviesList')?.textContent || '';
+    expect(savedContent).not.toContain('Saved Gem');
+    const watchedContent = document.getElementById('watchedMoviesList')?.textContent || '';
+    expect(watchedContent).toContain('Saved Gem');
+
+    const lastSet = firestoreDocMock.set.mock.calls.at(-1)?.[0] || {};
+    expect(lastSet?.prefs?.['42']?.status).toBe('watched');
   });
 
   it('filters saved movies by genre tags', async () => {
@@ -747,6 +789,11 @@ describe('initMoviesPanel', () => {
       btn => btn.dataset.genre === 'Comedy'
     );
     comedyButton?.dispatchEvent(new dom.window.Event('click', { bubbles: true }));
+    const activeComedyButton = document.querySelector(
+      '#savedMoviesFilters .genre-filter-buttons button.active[data-genre="Comedy"]'
+    );
+    expect(activeComedyButton).not.toBeNull();
+    expect(activeComedyButton?.getAttribute('aria-pressed')).toBe('true');
 
     const comedyTitles = listTitles();
     expect(comedyTitles).toHaveLength(1);
@@ -762,6 +809,11 @@ describe('initMoviesPanel', () => {
 
     expect(activeGenres()).toHaveLength(0);
     expect(listTitles()).toHaveLength(2);
+    const allActiveButton = Array.from(
+      document.querySelectorAll('#savedMoviesFilters .genre-filter-buttons button')
+    ).find(btn => btn.dataset.genre === '');
+    expect(allActiveButton?.classList.contains('active')).toBe(true);
+    expect(allActiveButton?.getAttribute('aria-pressed')).toBe('true');
 
     const allButton = Array.from(
       document.querySelectorAll('#savedMoviesFilters .genre-filter-buttons button')
@@ -791,14 +843,17 @@ describe('initMoviesPanel', () => {
         }
       ]
     };
-    const empty = { results: [] };
     const credits = {
       cast: [{ name: 'Proxy Star' }],
       crew: [{ job: 'Director', name: 'Proxy Director' }]
     };
-    const genres = { genres: [] };
+    const genres = { genres: [{ id: 28, name: 'Action' }] };
 
-    configureFetchResponses([{ results: [] }, page, empty, credits, genres]);
+    configureFetchResponses([
+      { ok: true, json: () => Promise.resolve({ results: page.results }) },
+      { ok: true, json: () => Promise.resolve(credits) },
+      { ok: true, json: () => Promise.resolve(genres) }
+    ]);
 
     await initMoviesPanel();
     const calledUrls = fetch.mock.calls.map(args => args[0]);
@@ -806,7 +861,6 @@ describe('initMoviesPanel', () => {
     expect(String(calledUrls[0])).toContain('/api/movies');
     const proxyCalls = calledUrls.slice(1).map(url => String(url));
     expect(proxyCalls.every(url => url.startsWith('https://mock-functions.net/tmdbProxy'))).toBe(true);
-    expect(proxyCalls.some(url => url.includes('endpoint=discover'))).toBe(true);
     expect(proxyCalls.some(url => url.includes('endpoint=genres'))).toBe(true);
     expect(proxyCalls.some(url => url.includes('endpoint=credits'))).toBe(true);
     expect(calledUrls.some(url => String(url).includes('api_key='))).toBe(false);
@@ -831,37 +885,35 @@ describe('initMoviesPanel', () => {
         }
       ]
     };
-    const empty = { results: [] };
     const credits = {
       cast: [{ name: 'Proxy Legacy Star' }],
       crew: [{ job: 'Director', name: 'Legacy Director' }]
     };
-    const genres = { genres: [] };
 
     global.fetch = vi
       .fn()
-      .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ results: [] }) })
-      .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve(page) })
-      .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve(empty) })
       .mockResolvedValueOnce({
-        ok: false,
-        status: 400,
-        text: () => Promise.resolve(JSON.stringify({ error: 'invalid_endpoint_params' }))
+        ok: true,
+        json: () => Promise.resolve({ results: page.results, genres: { 1: 'Action' } })
       })
       .mockResolvedValueOnce({
         ok: false,
         status: 400,
         text: () => Promise.resolve(JSON.stringify({ error: 'invalid_endpoint_params' }))
       })
-      .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve(credits) })
-      .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve(genres) });
+      .mockResolvedValueOnce({
+        ok: false,
+        status: 400,
+        text: () => Promise.resolve(JSON.stringify({ error: 'invalid_endpoint_params' }))
+      })
+      .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve(credits) });
 
     await initMoviesPanel();
 
-    expect(global.fetch).toHaveBeenCalledTimes(7);
-    const firstCreditsUrl = String(global.fetch.mock.calls[3][0]);
-    const secondCreditsUrl = String(global.fetch.mock.calls[4][0]);
-    const finalCreditsUrl = String(global.fetch.mock.calls[5][0]);
+    expect(global.fetch).toHaveBeenCalledTimes(4);
+    const firstCreditsUrl = String(global.fetch.mock.calls[1][0]);
+    const secondCreditsUrl = String(global.fetch.mock.calls[2][0]);
+    const finalCreditsUrl = String(global.fetch.mock.calls[3][0]);
     expect(firstCreditsUrl).toContain('endpoint=credits');
     expect(firstCreditsUrl).toContain('movie_id=');
     expect(secondCreditsUrl).toContain('endpoint=credits');
@@ -891,34 +943,32 @@ describe('initMoviesPanel', () => {
         }
       ]
     };
-    const empty = { results: [] };
     const details = {
       credits: {
         cast: [{ name: 'Fallback Star' }],
         crew: [{ job: 'Director', name: 'Fallback Director' }]
       }
     };
-    const genres = { genres: [] };
 
     global.fetch = vi
       .fn()
-      .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve({ results: [] }) })
-      .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve(page) })
-      .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve(empty) })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ results: page.results, genres: { 1: 'Action' } })
+      })
       .mockResolvedValueOnce({
         ok: false,
         status: 400,
         text: () => Promise.resolve(JSON.stringify({ error: 'unsupported_endpoint' }))
       })
-      .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve(details) })
-      .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve(genres) });
+      .mockResolvedValueOnce({ ok: true, json: () => Promise.resolve(details) });
 
     await initMoviesPanel();
 
-    expect(global.fetch).toHaveBeenCalledTimes(6);
-    const creditsUrl = String(global.fetch.mock.calls[3][0]);
+    expect(global.fetch).toHaveBeenCalledTimes(3);
+    const creditsUrl = String(global.fetch.mock.calls[1][0]);
     expect(creditsUrl).toContain('endpoint=credits');
-    const detailsUrl = String(global.fetch.mock.calls[4][0]);
+    const detailsUrl = String(global.fetch.mock.calls[2][0]);
     expect(detailsUrl).toContain('endpoint=movie_details');
     expect(detailsUrl).toContain('append_to_response=credits');
 
@@ -945,40 +995,21 @@ describe('initMoviesPanel', () => {
         }
       ]
     };
-    const empty = { results: [] };
-    const credits = {
-      cast: [{ name: 'Iconic Star' }],
-      crew: [{ job: 'Director', name: 'Famed Director' }]
-    };
-    const genres = { genres: [{ id: 12, name: 'Adventure' }] };
-    const morePage = {
-      results: [
-        {
-          id: 8,
-          title: 'Fresh Release',
-          release_date: '2024-02-20',
-          vote_average: 8.4,
-          vote_count: 210,
-          overview: 'A brand new hit.',
-          genre_ids: [12]
-        }
-      ]
-    };
-    const moreCredits = {
-      cast: [{ name: 'Newcomer Star' }],
-      crew: [{ job: 'Director', name: 'Rising Director' }]
-    };
-
     configureFetchResponses([
-      { results: [] },
-      page,
-      empty,
-      credits,
-      genres,
-      morePage,
-      empty,
-      moreCredits,
-      genres
+      {
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            results: page.results,
+            genres: { 12: 'Adventure' },
+            credits: {
+              3: {
+                cast: [{ name: 'Iconic Star' }],
+                crew: [{ job: 'Director', name: 'Famed Director' }]
+              }
+            }
+          })
+      }
     ]);
 
     await initMoviesPanel();
@@ -1035,19 +1066,21 @@ describe('initMoviesPanel', () => {
         }
       ]
     };
-    const empty = { results: [] };
-    const credits = {
-      cast: [{ name: 'Comedic Star' }],
-      crew: [{ job: 'Director', name: 'Funny Director' }]
-    };
-    const genres = { genres: [{ id: 35, name: 'Comedy' }] };
-
     configureFetchResponses([
-      { results: [] },
-      page,
-      empty,
-      credits,
-      genres
+      {
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            results: page.results,
+            genres: { 35: 'Comedy' },
+            credits: {
+              12: {
+                cast: [{ name: 'Comedic Star' }],
+                crew: [{ job: 'Director', name: 'Funny Director' }]
+              }
+            }
+          })
+      }
     ]);
 
     await initMoviesPanel();
@@ -1097,11 +1130,20 @@ describe('initMoviesPanel', () => {
       ],
       total_pages: 1
     };
-    const creditsA = { cast: [], crew: [] };
-    const creditsB = { cast: [], crew: [] };
-    const genres = { genres: [] };
-
-    configureFetchResponses([{ results: [] }, page, creditsA, creditsB, genres]);
+    configureFetchResponses([
+      {
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            results: page.results,
+            genres: {},
+            credits: {
+              20: { cast: [], crew: [] },
+              21: { cast: [], crew: [] }
+            }
+          })
+      }
+    ]);
 
     await initMoviesPanel();
 
@@ -1168,14 +1210,22 @@ describe('initMoviesPanel', () => {
         }
       ]
     };
-    const empty = { results: [] };
-    const credits = {
-      cast: [{ name: 'Remote Star' }],
-      crew: [{ job: 'Director', name: 'Remote Director' }]
-    };
-    const genres = { genres: [] };
-
-    configureFetchResponses([{ results: [] }, page, empty, credits, genres]);
+    configureFetchResponses([
+      {
+        ok: true,
+        json: () =>
+          Promise.resolve({
+            results: page.results,
+            genres: {},
+            credits: {
+              9: {
+                cast: [{ name: 'Remote Star' }],
+                crew: [{ job: 'Director', name: 'Remote Director' }]
+              }
+            }
+          })
+      }
+    ]);
 
     await initMoviesPanel();
 

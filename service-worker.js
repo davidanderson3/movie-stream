@@ -7,13 +7,9 @@ const PRECACHE_URLS = [
   './index.html',
   './style.css',
   './js/main.js',
-  './js/tabs.js',
   './js/movies.js',
-  './js/tabReports.js',
   './js/helpers.js',
   './js/auth.js',
-  './js/descriptions.js',
-  './js/siteName.js',
   './assets/favicon.png',
   './assets/favicon.ico'
 ];

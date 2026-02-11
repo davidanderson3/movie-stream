@@ -52,6 +52,16 @@ Create a `.env` in the project root (and optionally `backend/.env`) with the cre
 | `PLAID_CLIENT_ID`, `PLAID_SECRET`, `PLAID_ENV` | Plaid endpoints | Enable financial account linking workflows. |
 | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS` | `/contact` endpoint | Enable contact form email delivery. |
 | `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_FROM_NUMBER`, `ALERT_PHONE` | `scripts/tempAlert.js` | SMS alerts for monitoring. |
+| `ADMIN_REFRESH_TOKEN` | Admin cache endpoints | Required token for `/api/admin/refresh-movie-cache` and ratings prefetch endpoints. |
+| `GOOGLE_APPLICATION_CREDENTIALS` or `FIREBASE_SERVICE_ACCOUNT_PATH` | Firestore admin cache/persistence | Path to a Firebase service account JSON file. |
+| `FIREBASE_SERVICE_ACCOUNT_JSON` or `FIREBASE_SERVICE_ACCOUNT_BASE64` | Firestore admin cache/persistence | Inline service account JSON (raw or base64). |
+| `GOOGLE_CLOUD_PROJECT` (or `GCLOUD_PROJECT`) | Firestore admin cache/persistence | Explicit GCP project id used for Firestore writes. |
+| `CACHE_REQUIRE_FIRESTORE=true` | Shared cache layer | Disable in-memory fallback so cache writes only use Firestore. |
+| `OMDB_PREFETCH_DELAY_MS` | OMDb ratings prefetch | Base delay between OMDb requests (default `1500`). |
+| `OMDB_PREFETCH_JITTER_MS` | OMDb ratings prefetch | Random delay jitter added per request (default `350`). |
+| `OMDB_PREFETCH_MAX_FETCHES_PER_RUN` | OMDb ratings prefetch | Max network fetches per run (`0` = no cap). |
+| `OMDB_PREFETCH_CHECKPOINT_EVERY` | OMDb ratings prefetch | Persist checkpoint frequency while prefetch runs. |
+| `OMDB_PREFETCH_RETRY_AFTER_MS` | OMDb ratings prefetch | Retry wait hint after rate-limit responses. |
 
 Remember to also configure Firebase (see `firebase.json` and `.firebaserc`) if you deploy hosting or Cloud Functions.
 
@@ -67,6 +77,20 @@ Remember to also configure Firebase (see `firebase.json` and `.firebaserc`) if y
    This launches the Express server on `http://localhost:3003` and serves `index.html` plus the API proxies.
 3. **Set up API keys** – Supply environment variables for any services you plan to use (e.g., TMDB, OMDb, Spoonacular).
 4. **Optional Firebase emulators** – If you prefer not to use the production Firestore project during development, configure the Firebase emulator suite and point the app to it.
+5. **Verify cache backend** – Open `GET /api/cache-status?probe=1` and confirm both:
+   - `cache.firestore.available: true`
+   - `probe.ok: true`
+   before relying on persistent image cache.
+6. **Warm critic-score cache safely** – start background prefetch with:
+   ```bash
+   curl -X POST "http://localhost:3003/api/admin/prefetch-movie-ratings?token=YOUR_ADMIN_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"delayMs":1500,"jitterMs":350,"maxFetches":0,"checkpointEvery":10}'
+   ```
+   Check status with:
+   ```bash
+   curl "http://localhost:3003/api/admin/prefetch-movie-ratings?token=YOUR_ADMIN_TOKEN"
+   ```
 
 ## Testing
 - **Unit/integration tests** – run `npm test` to execute the Vitest suite (covers movie discovery flows, caching, and supporting helpers).

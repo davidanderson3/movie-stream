@@ -35,6 +35,10 @@ const MOVIE_RANGE_FETCH_LIMIT = Math.max(
   1,
   Number(process.env.MOVIE_CATALOG_RANGE_FETCH_LIMIT) || 2
 );
+const MOVIE_RANGE_REQUEST_DELAY_MS = Math.max(
+  0,
+  Number(process.env.MOVIE_CATALOG_RANGE_REQUEST_DELAY_MS) || 120
+);
 const NEW_RELEASE_CACHE_COLLECTION = 'movieNewReleases';
 const NEW_RELEASE_CACHE_VERSION = 'v1';
 const NEW_RELEASE_CACHE_TTL_MS = Math.max(
@@ -96,6 +100,13 @@ function parseDate(dateStr) {
   return ms;
 }
 
+function wait(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) {
+    return Promise.resolve();
+  }
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
 function computeRanking(score, voteCount, releaseDate, popularity) {
   const normalizedScore = Math.max(0, Math.min(Number(score) || 0, 10)) / 10;
   const voteWeight = Math.log10(Math.max(1, Number(voteCount) || 0) + 1);
@@ -116,6 +127,29 @@ function computeRanking(score, voteCount, releaseDate, popularity) {
   return normalizedScore * 5 + voteWeight * 0.75 + popWeight * 0.5 + recencyWeight * 0.75;
 }
 
+function normalizeGenreIds(movie) {
+  const ids = new Set();
+  const rawIds = movie?.genre_ids ?? movie?.genreIds ?? null;
+  if (Array.isArray(rawIds)) {
+    rawIds.forEach(value => {
+      const numeric = Number(value);
+      if (Number.isFinite(numeric)) {
+        ids.add(numeric);
+      }
+    });
+  }
+  if (Array.isArray(movie?.genres)) {
+    movie.genres.forEach(entry => {
+      if (entry == null) return;
+      const numeric = Number(typeof entry === 'number' ? entry : entry.id);
+      if (Number.isFinite(numeric)) {
+        ids.add(numeric);
+      }
+    });
+  }
+  return ids.size ? Array.from(ids).sort((a, b) => a - b) : [];
+}
+
 function normalizeMovie(movie, { allowLowScore = false } = {}) {
   if (!movie) return null;
   const title = typeof movie.title === 'string' ? movie.title.trim() : '';
@@ -126,6 +160,22 @@ function normalizeMovie(movie, { allowLowScore = false } = {}) {
   if (!allowLowScore && score < MIN_SCORE) return null;
   const idValue = movie.id ?? movie.movieID ?? movie.movieId ?? null;
   const id = idValue == null ? null : String(idValue);
+  const poster_path =
+    typeof movie.poster_path === 'string'
+      ? movie.poster_path
+      : typeof movie.posterPath === 'string'
+      ? movie.posterPath
+      : typeof movie.poster === 'string'
+      ? movie.poster
+      : null;
+  const backdrop_path =
+    typeof movie.backdrop_path === 'string'
+      ? movie.backdrop_path
+      : typeof movie.backdropPath === 'string'
+      ? movie.backdropPath
+      : typeof movie.backdrop === 'string'
+      ? movie.backdrop
+      : null;
   const releaseDate =
     typeof movie.releaseDate === 'string'
       ? movie.releaseDate
@@ -134,6 +184,7 @@ function normalizeMovie(movie, { allowLowScore = false } = {}) {
       : typeof movie.year === 'number'
       ? `${movie.year}-01-01`
       : null;
+  const genre_ids = normalizeGenreIds(movie);
   const voteCount = Number(
     movie.vote_count ?? movie.voteCount ?? (Array.isArray(movie.ratings) ? movie.ratings.length : 0) ?? 0
   );
@@ -144,7 +195,10 @@ function normalizeMovie(movie, { allowLowScore = false } = {}) {
     id,
     title,
     score,
+    poster_path,
+    backdrop_path,
     releaseDate,
+    genre_ids,
     voteCount,
     popularity,
     searchTitle,
@@ -159,7 +213,10 @@ function formatMovieForResponse(movie, source = 'catalog') {
     id: movie.id,
     title: movie.title,
     score: Number.isFinite(roundedScore) ? roundedScore : movie.score,
+    poster_path: movie.poster_path || null,
+    backdrop_path: movie.backdrop_path || null,
     releaseDate: movie.releaseDate || null,
+    genre_ids: Array.isArray(movie.genre_ids) ? movie.genre_ids : [],
     voteCount: Number.isFinite(movie.voteCount) ? movie.voteCount : null,
     popularity: Number.isFinite(movie.popularity) ? movie.popularity : null,
     source
@@ -173,14 +230,30 @@ function stripDerivedMovieFields(movie) {
   if (!id || !title) return null;
   const score = Number(movie.score);
   if (!Number.isFinite(score)) return null;
+  const poster_path =
+    typeof movie.poster_path === 'string'
+      ? movie.poster_path
+      : typeof movie.posterPath === 'string'
+      ? movie.posterPath
+      : null;
+  const backdrop_path =
+    typeof movie.backdrop_path === 'string'
+      ? movie.backdrop_path
+      : typeof movie.backdropPath === 'string'
+      ? movie.backdropPath
+      : null;
   const releaseDate = typeof movie.releaseDate === 'string' && movie.releaseDate ? movie.releaseDate : null;
+  const genre_ids = normalizeGenreIds(movie);
   const voteCount = Number.isFinite(Number(movie.voteCount)) ? Number(movie.voteCount) : null;
   const popularity = Number.isFinite(Number(movie.popularity)) ? Number(movie.popularity) : null;
   return {
     id,
     title,
     score,
+    poster_path,
+    backdrop_path,
     releaseDate,
+    genre_ids,
     voteCount,
     popularity
   };
@@ -230,6 +303,24 @@ async function loadCatalogFromFirestore() {
   }
 }
 
+async function loadCatalogFromRangeCache() {
+  const ranges = buildReleaseRanges();
+  if (!ranges.length) return null;
+  const entries = [];
+  for (const range of ranges) {
+    // eslint-disable-next-line no-await-in-loop
+    const cached = await loadRangeFromCache(range, 0);
+    if (cached) {
+      entries.push(cached);
+    }
+  }
+  if (!entries.length) return null;
+  const movies = mergeRangeMovies(entries);
+  if (!movies.length) return null;
+  const metadata = summarizeRangeMetadata(entries, movies, ranges.length, 0);
+  return { movies, metadata };
+}
+
 async function persistCatalog() {
   if (!state.movies.length) return;
   const payload = {
@@ -273,11 +364,11 @@ function rangeCacheParts(range) {
   return ['range', MOVIE_RANGE_CACHE_VERSION, range.startDate, range.endDate];
 }
 
-async function loadRangeFromCache(range) {
+async function loadRangeFromCache(range, ttlMs = MOVIE_RANGE_CACHE_TTL_MS) {
   const cached = await readCachedResponse(
     MOVIE_RANGE_CACHE_COLLECTION,
     rangeCacheParts(range),
-    MOVIE_RANGE_CACHE_TTL_MS
+    ttlMs
   );
   if (!cached || typeof cached.body !== 'string' || !cached.body.length) {
     return null;
@@ -632,7 +723,7 @@ async function fetchLegacyCatalog() {
   }
 }
 
-async function fetchCuratedCatalog() {
+async function fetchCuratedCatalog(options = {}) {
   const isTestEnvironment =
     process.env.VITEST === 'true' ||
     process.env.NODE_ENV === 'test' ||
@@ -662,9 +753,11 @@ async function fetchCuratedCatalog() {
   const preparedRanges = [];
   const missingRanges = [];
 
+  const bypassRangeCache = Boolean(options.bypassRangeCache);
+
   for (const range of ranges) {
     // eslint-disable-next-line no-await-in-loop
-    const cached = await loadRangeFromCache(range);
+    const cached = bypassRangeCache ? null : await loadRangeFromCache(range);
     if (cached) {
       preparedRanges.push(cached);
     } else {
@@ -673,7 +766,10 @@ async function fetchCuratedCatalog() {
   }
 
   let fetchedThisRun = 0;
-  const fetchBudget = preparedRanges.length ? MOVIE_RANGE_FETCH_LIMIT : missingRanges.length;
+  const fetchAllRanges = options.fetchAllRanges !== false;
+  const fetchBudget = fetchAllRanges
+    ? missingRanges.length
+    : (preparedRanges.length ? MOVIE_RANGE_FETCH_LIMIT : missingRanges.length);
   const maxFetches = Math.min(missingRanges.length, fetchBudget);
   if (missingRanges.length && maxFetches > 0) {
     for (const range of missingRanges) {
@@ -690,6 +786,10 @@ async function fetchCuratedCatalog() {
           fetchedThisRun += 1;
           // eslint-disable-next-line no-await-in-loop
           await cacheRangeMovies(range, result.movies, result.metadata);
+          if (fetchedThisRun < maxFetches) {
+            // eslint-disable-next-line no-await-in-loop
+            await wait(MOVIE_RANGE_REQUEST_DELAY_MS);
+          }
         }
       } catch (err) {
         console.error(`TMDB range fetch failed for ${range.label}`, err);
@@ -730,6 +830,15 @@ async function hydrateFromStorage() {
     });
     return state;
   }
+  const rangeCatalog = await loadCatalogFromRangeCache();
+  if (rangeCatalog && Array.isArray(rangeCatalog.movies) && rangeCatalog.movies.length) {
+    applyState(rangeCatalog.movies, {
+      ...rangeCatalog.metadata,
+      updatedAt: rangeCatalog.metadata?.fetchedAt || new Date().toISOString(),
+      loadedFrom: 'range-cache'
+    });
+    return state;
+  }
   return state;
 }
 
@@ -739,7 +848,7 @@ function shouldRefresh() {
   return Date.now() - state.updatedAt > STALE_AFTER_MS;
 }
 
-async function refreshCatalog({ force = false } = {}) {
+async function refreshCatalog({ force = false, bypassRangeCache = false } = {}) {
   if (!force && !shouldRefresh()) {
     return state;
   }
@@ -747,7 +856,7 @@ async function refreshCatalog({ force = false } = {}) {
     return refreshPromise;
   }
   refreshPromise = (async () => {
-    const catalog = await fetchCuratedCatalog();
+    const catalog = await fetchCuratedCatalog({ bypassRangeCache });
     applyState(catalog.movies, { ...catalog.metadata, updatedAt: new Date().toISOString() });
     await persistCatalog();
     return state;
@@ -778,9 +887,6 @@ async function init() {
   if (!hydratePromise) {
     hydratePromise = (async () => {
       await hydrateFromStorage();
-      if (!state.movies.length) {
-        await refreshCatalog({ force: true });
-      }
       startRefreshTimer();
       return state;
     })();
@@ -790,21 +896,39 @@ async function init() {
 
 async function ensureCatalog(options = {}) {
   await init();
-  if (options.forceRefresh) {
-    await refreshCatalog({ force: true });
-  } else if (shouldRefresh()) {
-    await refreshCatalog();
+  const cacheOnly = Boolean(options.cacheOnly);
+  if (!cacheOnly) {
+    if (options.forceRefresh) {
+      await refreshCatalog({
+        force: true,
+        bypassRangeCache: Boolean(options.bypassRangeCache)
+      });
+    } else if (shouldRefresh()) {
+      if (options.allowStale && state.movies.length) {
+        refreshCatalog().catch(err => {
+          console.error('Movie catalog background refresh failed', err);
+        });
+      } else {
+        await refreshCatalog();
+      }
+    }
   }
   return state;
 }
 
-function buildSearchMatches(query, { limit, minScore }) {
+function buildSearchMatches(query, { limit, minScore, excludeIds } = {}) {
   const normalizedQuery = String(query || '').trim().toLowerCase();
   const targetMinScore = Number.isFinite(minScore) ? Number(minScore) : MIN_SCORE;
   const matches = [];
   const isEmptyQuery = !normalizedQuery.length;
   const tokens = normalizedQuery.split(/\s+/).filter(Boolean);
+  const excludeSet = excludeIds instanceof Set
+    ? excludeIds
+    : new Set(Array.isArray(excludeIds) ? excludeIds.map(id => String(id)) : []);
   for (const movie of state.movies) {
+    if (excludeSet.size && movie?.id != null && excludeSet.has(String(movie.id))) {
+      continue;
+    }
     if (movie.score < targetMinScore) continue;
     if (isEmptyQuery) {
       matches.push({ movie, score: movie.ranking });
@@ -843,7 +967,8 @@ function searchCatalog(query, options = {}) {
   if (!state.movies.length) return [];
   const limit = Math.max(1, Number(options.limit) || DEFAULT_LIMIT);
   const minScore = options.minScore;
-  return buildSearchMatches(query, { limit, minScore }).results;
+  const excludeIds = options.excludeIds;
+  return buildSearchMatches(query, { limit, minScore, excludeIds }).results;
 }
 
 function searchCatalogWithStats(query, options = {}) {
@@ -852,7 +977,8 @@ function searchCatalogWithStats(query, options = {}) {
   }
   const limit = Math.max(1, Number(options.limit) || DEFAULT_LIMIT);
   const minScore = options.minScore;
-  return buildSearchMatches(query, { limit, minScore });
+  const excludeIds = options.excludeIds;
+  return buildSearchMatches(query, { limit, minScore, excludeIds });
 }
 
 function recentThresholdDate() {
