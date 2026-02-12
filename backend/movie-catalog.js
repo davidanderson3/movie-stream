@@ -916,6 +916,189 @@ async function ensureCatalog(options = {}) {
   return state;
 }
 
+function hasImagePath(value) {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function normalizeTmdbImagePath(value) {
+  if (typeof value !== 'string') return '';
+  const trimmed = value.trim();
+  if (!trimmed) return '';
+  if (/^https?:\/\//i.test(trimmed)) return trimmed;
+  return trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
+}
+
+function pickPosterPathFromTmdbImages(imagesPayload) {
+  const posters = Array.isArray(imagesPayload?.posters) ? imagesPayload.posters : [];
+  const withPaths = posters
+    .map(entry => ({
+      filePath: normalizeTmdbImagePath(entry?.file_path),
+      voteCount: Number(entry?.vote_count) || 0,
+      voteAverage: Number(entry?.vote_average) || 0,
+      width: Number(entry?.width) || 0,
+      height: Number(entry?.height) || 0
+    }))
+    .filter(entry => entry.filePath);
+  if (!withPaths.length) return '';
+  withPaths.sort((a, b) => {
+    if (b.voteCount !== a.voteCount) return b.voteCount - a.voteCount;
+    if (b.voteAverage !== a.voteAverage) return b.voteAverage - a.voteAverage;
+    if (b.width !== a.width) return b.width - a.width;
+    return b.height - a.height;
+  });
+  return withPaths[0].filePath;
+}
+
+function summarizeMovieForImageReport(movie) {
+  if (!movie) return null;
+  return {
+    id: movie.id == null ? null : String(movie.id),
+    title: movie.title || null,
+    releaseDate: movie.releaseDate || null,
+    score: Number.isFinite(Number(movie.score)) ? Number(movie.score) : null,
+    poster_path: hasImagePath(movie.poster_path) ? movie.poster_path : null,
+    backdrop_path: hasImagePath(movie.backdrop_path) ? movie.backdrop_path : null
+  };
+}
+
+function getMissingImageStats(options = {}) {
+  const sampleSize = Math.max(1, Math.min(500, Number(options.sampleSize) || 25));
+  const movies = Array.isArray(state.movies) ? state.movies : [];
+  const missingPoster = [];
+  const missingDisplayImage = [];
+
+  movies.forEach(movie => {
+    const hasPoster = hasImagePath(movie?.poster_path);
+    const hasBackdrop = hasImagePath(movie?.backdrop_path);
+    if (!hasPoster) {
+      missingPoster.push(movie);
+    }
+    if (!hasPoster && !hasBackdrop) {
+      missingDisplayImage.push(movie);
+    }
+  });
+
+  return {
+    catalogTotal: movies.length,
+    missingPosterCount: missingPoster.length,
+    missingDisplayImageCount: missingDisplayImage.length,
+    sampleMissingPoster: missingPoster.slice(0, sampleSize).map(summarizeMovieForImageReport),
+    sampleMissingDisplayImage: missingDisplayImage
+      .slice(0, sampleSize)
+      .map(summarizeMovieForImageReport)
+  };
+}
+
+async function backfillMissingPosters(options = {}) {
+  await init();
+  const credentials = getTmdbCredentials();
+  const missingBefore = getMissingImageStats({ sampleSize: 1 });
+  const limitValue = Number(options.limit);
+  const limit = Number.isFinite(limitValue) && limitValue > 0 ? Math.floor(limitValue) : 0;
+  const delayValue = Number(options.delayMs);
+  const delayMs = Number.isFinite(delayValue) && delayValue >= 0 ? Math.floor(delayValue) : 200;
+  const targets = (Array.isArray(state.movies) ? state.movies : []).filter(
+    movie => !hasImagePath(movie?.poster_path)
+  );
+  const selectedTargets = limit > 0 ? targets.slice(0, limit) : targets.slice();
+
+  const summary = {
+    credentialsAvailable: Boolean(credentials),
+    catalogTotal: missingBefore.catalogTotal,
+    missingPosterBefore: missingBefore.missingPosterCount,
+    missingDisplayImageBefore: missingBefore.missingDisplayImageCount,
+    attempted: selectedTargets.length,
+    processed: 0,
+    updated: 0,
+    unchanged: 0,
+    skipped: 0,
+    failed: 0,
+    updatedIds: []
+  };
+
+  if (!credentials || !selectedTargets.length) {
+    const after = getMissingImageStats({ sampleSize: 1 });
+    summary.missingPosterAfter = after.missingPosterCount;
+    summary.missingDisplayImageAfter = after.missingDisplayImageCount;
+    return summary;
+  }
+
+  const updatesById = new Map();
+  for (const movie of selectedTargets) {
+    summary.processed += 1;
+    const movieId = String(movie.id == null ? '' : movie.id).trim();
+    if (!/^\d+$/.test(movieId)) {
+      summary.skipped += 1;
+      continue;
+    }
+
+    try {
+      const detailData = await tmdbRequest(
+        `movie/${movieId}`,
+        new URLSearchParams({ language: 'en-US' }),
+        credentials
+      );
+      let posterPath = normalizeTmdbImagePath(detailData?.poster_path);
+      if (!posterPath) {
+        const imagesData = await tmdbRequest(
+          `movie/${movieId}/images`,
+          new URLSearchParams({ include_image_language: 'en,null' }),
+          credentials
+        );
+        posterPath = pickPosterPathFromTmdbImages(imagesData);
+      }
+
+      if (!posterPath) {
+        summary.unchanged += 1;
+      } else {
+        const updatedMovie = {
+          ...movie,
+          poster_path: posterPath
+        };
+        if (!hasImagePath(updatedMovie.backdrop_path)) {
+          const backdropPath = normalizeTmdbImagePath(detailData?.backdrop_path);
+          if (backdropPath) {
+            updatedMovie.backdrop_path = backdropPath;
+          }
+        }
+        updatesById.set(String(movie.id), updatedMovie);
+        summary.updated += 1;
+        if (summary.updatedIds.length < 200) {
+          summary.updatedIds.push(String(movie.id));
+        }
+      }
+    } catch (err) {
+      summary.failed += 1;
+      console.warn(`Poster backfill failed for movie ${movieId}`, err?.message || err);
+    }
+
+    if (delayMs > 0 && summary.processed < selectedTargets.length) {
+      // Avoid hammering TMDB while backfilling missing posters.
+      // eslint-disable-next-line no-await-in-loop
+      await wait(delayMs);
+    }
+  }
+
+  if (updatesById.size) {
+    const mergedMovies = state.movies.map(movie => {
+      const updated = updatesById.get(String(movie?.id));
+      return updated ? updated : movie;
+    });
+    applyState(mergedMovies, {
+      ...state.metadata,
+      updatedAt: new Date().toISOString(),
+      posterBackfillAt: new Date().toISOString(),
+      posterBackfillUpdated: updatesById.size
+    });
+    await persistCatalog();
+  }
+
+  const after = getMissingImageStats({ sampleSize: 1 });
+  summary.missingPosterAfter = after.missingPosterCount;
+  summary.missingDisplayImageAfter = after.missingDisplayImageCount;
+  return summary;
+}
+
 function buildSearchMatches(query, { limit, minScore, excludeIds } = {}) {
   const normalizedQuery = String(query || '').trim().toLowerCase();
   const targetMinScore = Number.isFinite(minScore) ? Number(minScore) : MIN_SCORE;
@@ -1190,6 +1373,8 @@ module.exports = {
   init,
   stop,
   ensureCatalog,
+  getMissingImageStats,
+  backfillMissingPosters,
   searchCatalog,
   searchCatalogWithStats,
   fetchNewReleases,

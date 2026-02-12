@@ -38,8 +38,6 @@ function buildDom() {
       <div id="movieStatus" class="movie-status"></div>
       <div id="movieList"></div>
       <div id="movieStatusBottom" class="movie-status movie-status--bottom"></div>
-      <button id="movieRatingToggle" type="button">Show filtered rating distribution</button>
-      <div id="movieRatingPanel" hidden><ul id="movieRatingList"></ul></div>
     </div>
     <div id="savedMoviesSection" style="display:none">
       <div id="savedMoviesFilters" class="genre-filter"></div>
@@ -823,6 +821,145 @@ describe('initMoviesPanel', () => {
     allButton?.dispatchEvent(new dom.window.Event('click', { bubbles: true }));
 
     expect(listTitles()).toHaveLength(2);
+  });
+
+  it('sorts saved movies by weighted critic blend before interest', async () => {
+    const dom = buildDom();
+    attachWindow(dom);
+    window.tmdbApiKey = 'TEST_KEY';
+
+    const userId = 'critic-sort-user';
+    authModuleMock.getCurrentUser.mockReturnValue({ uid: userId });
+    authModuleMock.awaitAuthUser.mockResolvedValue({ uid: userId });
+
+    firestoreDocMock.get.mockResolvedValue({
+      exists: true,
+      data: () => ({
+        prefs: {
+          '100': {
+            status: 'interested',
+            interest: 1,
+            updatedAt: 1,
+            movie: {
+              id: 100,
+              title: 'Critic Darling',
+              release_date: '2022-01-01',
+              poster_path: '',
+              overview: '',
+              genre_ids: [18],
+              criticScores: {
+                rottenTomatoes: 95,
+                metacritic: 88,
+                imdb: 8.5
+              }
+            }
+          },
+          '200': {
+            status: 'interested',
+            interest: 5,
+            updatedAt: 2,
+            movie: {
+              id: 200,
+              title: 'Mixed Reviews',
+              release_date: '2022-01-02',
+              poster_path: '',
+              overview: '',
+              genre_ids: [18],
+              criticScores: {
+                rottenTomatoes: 78,
+                metacritic: 60,
+                imdb: 6.9
+              }
+            }
+          }
+        }
+      })
+    });
+
+    const cachedResponse = {
+      results: Array.from({ length: 12 }, (_, index) => ({
+        id: 700 + index,
+        title: `Cached ${index + 1}`,
+        release_date: '2024-01-01',
+        vote_average: 7.5,
+        vote_count: 150,
+        overview: '',
+        genre_ids: []
+      })),
+      genres: {
+        18: 'Drama'
+      }
+    };
+
+    configureFetchResponses([
+      {
+        ok: true,
+        json: () => Promise.resolve(cachedResponse)
+      }
+    ]);
+
+    await initMoviesPanel();
+
+    const savedTitles = Array.from(document.querySelectorAll('#savedMoviesList h3')).map(el => el.textContent);
+    expect(savedTitles[0]).toContain('Critic Darling');
+    expect(savedTitles[1]).toContain('Mixed Reviews');
+  });
+
+  it('prefers catalog poster for saved movies when local snapshot poster is stale', async () => {
+    const dom = buildDom();
+    attachWindow(dom);
+    window.tmdbApiKey = 'TEST_KEY';
+
+    const userId = 'poster-fix-user';
+    authModuleMock.getCurrentUser.mockReturnValue({ uid: userId });
+    authModuleMock.awaitAuthUser.mockResolvedValue({ uid: userId });
+
+    firestoreDocMock.get.mockResolvedValue({
+      exists: true,
+      data: () => ({
+        prefs: {
+          '42': {
+            status: 'interested',
+            interest: 3,
+            updatedAt: 1,
+            movie: {
+              id: 42,
+              title: 'Poster Priority Test',
+              release_date: '2024-01-01',
+              poster_path: '/wrong-poster.jpg',
+              overview: '',
+              genre_ids: [18]
+            }
+          }
+        }
+      })
+    });
+
+    const cachedResponse = {
+      results: Array.from({ length: 12 }, (_, index) => ({
+        id: index === 0 ? 42 : 800 + index,
+        title: index === 0 ? 'Poster Priority Test' : `Cached ${index + 1}`,
+        release_date: '2024-01-01',
+        vote_average: 7.5,
+        vote_count: 150,
+        overview: '',
+        genre_ids: [18],
+        poster_path: index === 0 ? '/correct-poster.jpg' : '/other.jpg'
+      })),
+      genres: { 18: 'Drama' },
+      credits: {}
+    };
+
+    configureFetchResponses([
+      { ok: true, json: () => Promise.resolve(cachedResponse) }
+    ]);
+
+    await initMoviesPanel();
+
+    const savedImg = document.querySelector('#savedMoviesList img');
+    expect(savedImg).not.toBeNull();
+    expect(savedImg?.src || '').toContain('path=%2Fcorrect-poster.jpg');
+    expect(savedImg?.src || '').not.toContain('path=%2Fwrong-poster.jpg');
   });
 
   it('routes movie requests through the Cloud Function proxy', async () => {

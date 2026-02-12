@@ -57,8 +57,6 @@ const unsupportedProxyEndpoints = new Set();
 let loggedProxyCreditsUnsupported = false;
 
 const SUPPRESSED_STATUSES = new Set(['watched', 'notInterested', 'interested']);
-const RATING_DISTRIBUTION_PRECISION = 0.1;
-const RATING_DISTRIBUTION_LIMIT = 5;
 
 const FEED_FILTERS_KEY = 'movieFeedFilters';
 const DEFAULT_FEED_FILTER_STATE = Object.freeze({
@@ -70,10 +68,6 @@ const DEFAULT_FEED_FILTER_STATE = Object.freeze({
 });
 
 let feedFilterState = { ...DEFAULT_FEED_FILTER_STATE };
-
-let ratingDistributionVisible = false;
-let ratingDistributionData = null;
-let pendingRatingDistributionPromise = null;
 
 function getDocument() {
   return typeof document !== 'undefined' ? document : null;
@@ -106,9 +100,6 @@ const domRefs = {
   feedStatus: null,
   feedStatusBottom: null,
   unclassifiedCount: null,
-  ratingDistributionToggle: null,
-  ratingDistributionPanel: null,
-  ratingDistributionList: null,
   feedMinRating: null,
   feedMinVotes: null,
   feedStartYear: null,
@@ -142,6 +133,19 @@ const handlers = {
 const criticScoreStateById = new Map();
 const restoredMoviesById = new Map();
 const CRITIC_SCORE_TYPE = 'movie';
+const SAVED_CRITIC_SORT_WEIGHTS = Object.freeze({
+  rottenTomatoes: 0.5,
+  metacritic: 0.3,
+  imdb: 0.2
+});
+const attemptedPosterRecoveryIds = new Set();
+const pendingPosterRecoveryById = new Map();
+const AUTO_CRITIC_FETCH_CONCURRENCY = 4;
+const AUTO_CRITIC_FETCH_BATCH_LIMIT = 60;
+const autoCriticFetchQueue = [];
+const autoCriticQueuedKeys = new Set();
+const autoCriticInFlightKeys = new Set();
+let autoCriticInFlightCount = 0;
 
 const STATUS_TONE_CLASSES = Object.freeze({
   info: 'movie-status--info',
@@ -510,7 +514,101 @@ function getCriticScoresButtonLabel(state) {
   return 'Fetch scores';
 }
 
-async function requestCriticScores(movie, { force = false } = {}) {
+function isAutoCriticFetchEnabled() {
+  if (typeof globalThis !== 'undefined' && globalThis.__MOVIES_DISABLE_AUTO_CRITIC_FETCH__) {
+    return false;
+  }
+  if (
+    typeof process !== 'undefined' &&
+    process.env &&
+    (process.env.VITEST === 'true' || process.env.NODE_ENV === 'test')
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function isPosterRecoveryEnabled() {
+  if (typeof globalThis !== 'undefined' && globalThis.__MOVIES_DISABLE_POSTER_RECOVERY__) {
+    return false;
+  }
+  if (
+    typeof process !== 'undefined' &&
+    process.env &&
+    (process.env.VITEST === 'true' || process.env.NODE_ENV === 'test')
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function isElementVisibleForAutoFetch(el) {
+  if (!el) return false;
+  if (el.style && el.style.display === 'none') return false;
+  if (typeof window !== 'undefined' && typeof window.getComputedStyle === 'function') {
+    const style = window.getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden') return false;
+  }
+  return true;
+}
+
+function pumpAutoCriticFetchQueue() {
+  if (!isAutoCriticFetchEnabled()) return;
+  while (
+    autoCriticInFlightCount < AUTO_CRITIC_FETCH_CONCURRENCY &&
+    autoCriticFetchQueue.length
+  ) {
+    const movie = autoCriticFetchQueue.shift();
+    if (!movie) continue;
+    const key = getMovieCacheKey(movie);
+    if (!key) continue;
+    autoCriticQueuedKeys.delete(key);
+    if (autoCriticInFlightKeys.has(key)) continue;
+    const state = getCriticScoreState(movie);
+    if (state.status !== 'idle') continue;
+
+    autoCriticInFlightCount += 1;
+    autoCriticInFlightKeys.add(key);
+    requestCriticScores(movie, {
+      force: false,
+      refresh: false,
+      showLoading: false
+    })
+      .catch(() => null)
+      .finally(() => {
+        autoCriticInFlightCount = Math.max(0, autoCriticInFlightCount - 1);
+        autoCriticInFlightKeys.delete(key);
+        pumpAutoCriticFetchQueue();
+        if (autoCriticInFlightCount === 0 && autoCriticFetchQueue.length === 0) {
+          refreshUI();
+        }
+      });
+  }
+}
+
+function enqueueAutoCriticScores(movies) {
+  if (!isAutoCriticFetchEnabled()) return;
+  if (!Array.isArray(movies) || !movies.length) return;
+  const targetMovies = movies.slice(0, AUTO_CRITIC_FETCH_BATCH_LIMIT);
+
+  targetMovies.forEach(movie => {
+    if (!movie || !canRequestCriticScores(movie)) return;
+    const key = getMovieCacheKey(movie);
+    if (!key) return;
+    if (autoCriticQueuedKeys.has(key) || autoCriticInFlightKeys.has(key)) return;
+    const state = getCriticScoreState(movie);
+    if (state.status !== 'idle') return;
+    autoCriticQueuedKeys.add(key);
+    autoCriticFetchQueue.push(movie);
+  });
+
+  pumpAutoCriticFetchQueue();
+}
+
+async function requestCriticScores(
+  movie,
+  { force = false, refresh = true, showLoading = true } = {}
+) {
   if (!movie) return null;
   const state = getCriticScoreState(movie);
   if (!force && (state.status === 'loading' || state.status === 'loaded')) {
@@ -523,7 +621,7 @@ async function requestCriticScores(movie, { force = false } = {}) {
       status: 'error',
       error: 'Not enough information to fetch critic scores.'
     });
-    refreshUI();
+    if (refresh) refreshUI();
     return null;
   }
 
@@ -532,7 +630,9 @@ async function requestCriticScores(movie, { force = false } = {}) {
     data: state.data || null,
     error: state.error
   });
-  refreshUI();
+  if (showLoading && refresh) {
+    refreshUI();
+  }
 
   try {
     const params = new URLSearchParams();
@@ -563,18 +663,18 @@ async function requestCriticScores(movie, { force = false } = {}) {
         status: 'error',
         error: 'Critic scores are unavailable for this title.'
       });
-      refreshUI();
+      if (refresh) refreshUI();
       return null;
     }
     setCriticScoreState(movie, { status: 'loaded', data: normalized });
-    refreshUI();
+    if (refresh) refreshUI();
     return normalized;
   } catch (err) {
     setCriticScoreState(movie, {
       status: 'error',
       error: summarizeError(err)
     });
-    refreshUI();
+    if (refresh) refreshUI();
     return null;
   }
 }
@@ -609,6 +709,58 @@ function appendCriticScoresMeta(metaList, movie) {
   }
 
   metaList.appendChild(item);
+}
+
+function computeWeightedCriticBlend(movie) {
+  if (!movie) {
+    return { value: null, signalCount: 0, weightUsed: 0 };
+  }
+  const state = getCriticScoreState(movie);
+  const scores = normalizeCriticScoresObject(state?.data || movie.criticScores);
+  if (!scores) {
+    return { value: null, signalCount: 0, weightUsed: 0 };
+  }
+
+  const signals = [];
+  if (Number.isFinite(scores.rottenTomatoes)) {
+    signals.push({
+      value: scores.rottenTomatoes,
+      weight: SAVED_CRITIC_SORT_WEIGHTS.rottenTomatoes
+    });
+  }
+  if (Number.isFinite(scores.metacritic)) {
+    signals.push({
+      value: scores.metacritic,
+      weight: SAVED_CRITIC_SORT_WEIGHTS.metacritic
+    });
+  }
+  if (Number.isFinite(scores.imdb)) {
+    signals.push({
+      value: scores.imdb * 10,
+      weight: SAVED_CRITIC_SORT_WEIGHTS.imdb
+    });
+  }
+
+  if (!signals.length) {
+    return { value: null, signalCount: 0, weightUsed: 0 };
+  }
+
+  let weightedTotal = 0;
+  let totalWeight = 0;
+  signals.forEach(signal => {
+    weightedTotal += signal.value * signal.weight;
+    totalWeight += signal.weight;
+  });
+
+  if (!Number.isFinite(totalWeight) || totalWeight <= 0) {
+    return { value: null, signalCount: 0, weightUsed: 0 };
+  }
+
+  return {
+    value: weightedTotal / totalWeight,
+    signalCount: signals.length,
+    weightUsed: totalWeight
+  };
 }
 
 function updateFeedStatus(
@@ -1384,289 +1536,6 @@ function updateUnclassifiedCount() {
   el.textContent = '';
 }
 
-function handleRatingDistributionToggle() {
-  ratingDistributionVisible = !ratingDistributionVisible;
-  updateRatingDistributionPanel();
-}
-
-function updateRatingDistributionPanel() {
-  const toggle = domRefs.ratingDistributionToggle;
-  const panel = domRefs.ratingDistributionPanel;
-  const footnote = panel?.querySelector('.movie-rating-distribution__footnote') || null;
-  const hasFilters = hasActiveFeedFilters();
-  const toggleLabel = hasFilters
-    ? 'Show filtered rating distribution'
-    : 'Show catalog rating distribution';
-  const toggleLabelActive = hasFilters
-    ? 'Hide filtered rating distribution'
-    : 'Hide catalog rating distribution';
-  if (toggle) {
-    toggle.setAttribute('aria-expanded', ratingDistributionVisible ? 'true' : 'false');
-    toggle.textContent = ratingDistributionVisible ? toggleLabelActive : toggleLabel;
-  }
-  if (footnote) {
-    footnote.textContent = hasFilters
-      ? 'Top 5 rating ranges at 0.1 increments after applying your filters (excluding min rating).'
-      : 'Top 5 rating ranges at 0.1 increments from the movie catalog.';
-  }
-  if (panel) {
-    panel.hidden = !ratingDistributionVisible;
-  }
-  if (!ratingDistributionVisible) return;
-  renderRatingDistributionLoading();
-
-  const moviesForDistribution = getRatingDistributionMovies();
-  if (moviesForDistribution) {
-    renderRatingDistributionItems(buildLocalRatingDistribution(moviesForDistribution));
-    return;
-  }
-
-  ensureRatingDistributionData()
-    .then(items => {
-      renderRatingDistributionItems(items);
-    })
-    .catch(err => {
-      console.warn('Rating distribution fetch failed', err);
-      renderRatingDistributionItems(buildLocalRatingDistribution());
-    });
-}
-
-function renderRatingDistributionLoading() {
-  const list = domRefs.ratingDistributionList;
-  if (!list) return;
-  list.innerHTML =
-    '<li class="movie-rating-distribution__item">Loading rating distribution…</li>';
-}
-
-function renderRatingDistributionItems(items) {
-  const list = domRefs.ratingDistributionList;
-  if (!list) return;
-  const bucketItems = Array.isArray(items) ? items.slice() : [];
-  if (!bucketItems.length) {
-    list.innerHTML =
-      '<li class="movie-rating-distribution__item">Rating distribution data unavailable.</li>';
-    return;
-  }
-  bucketItems.sort((a, b) => {
-    const aValue = Number.parseFloat(String(a?.label ?? '')) || 0;
-    const bValue = Number.parseFloat(String(b?.label ?? '')) || 0;
-    return bValue - aValue;
-  });
-  const formatted = bucketItems
-    .map(item => {
-      const rawLabel = String(item.label ?? '');
-      const parsed = Number.parseFloat(rawLabel);
-      const label = Number.isFinite(parsed) ? parsed.toFixed(1) : rawLabel;
-      const count = Number.isFinite(Number(item.count)) ? Number(item.count) : 0;
-      const isActive = feedFilterState.minRating === label;
-      const buttonClass = isActive
-        ? 'movie-rating-distribution__value movie-rating-distribution__value--active'
-        : 'movie-rating-distribution__value';
-      return `
-        <li class="movie-rating-distribution__item">
-          <button
-            type="button"
-            class="${buttonClass}"
-            data-rating="${escapeForAttribute(label)}"
-            aria-pressed="${isActive ? 'true' : 'false'}"
-          >
-            ${escapeForAttribute(label)}
-          </button>
-          <span>${formatStatValue(count)} titles</span>
-        </li>`;
-    })
-    .join('');
-  list.innerHTML = formatted;
-  const buttons = Array.from(list.querySelectorAll('[data-rating]'));
-  buttons.forEach(btn => {
-    btn.addEventListener('click', () => {
-      const value = btn.dataset.rating;
-      const nextValue = feedFilterState.minRating === value ? '' : value;
-      setFeedFilter('minRating', nextValue, { sanitize: true, persist: true });
-      updateRatingDistributionPanel();
-    });
-  });
-}
-
-function getRatingDistributionMovies() {
-  if (!Array.isArray(currentMovies) || !currentMovies.length) {
-    return null;
-  }
-  const baseMovies = getFeedMovies(currentMovies);
-  if (!baseMovies.length) return [];
-  return applyFeedFiltersWithOverrides(baseMovies, { minRating: '' });
-}
-
-function buildLocalRatingDistribution(moviesInput) {
-  const movies = Array.isArray(moviesInput)
-    ? moviesInput
-    : getAllUnclassifiedMovieSummaries();
-  if (!movies.length) return [];
-  const precision =
-    Number.isFinite(Number(RATING_DISTRIBUTION_PRECISION)) && RATING_DISTRIBUTION_PRECISION > 0
-      ? Number(RATING_DISTRIBUTION_PRECISION)
-      : 0.1;
-  const limit =
-    Number.isFinite(Number(RATING_DISTRIBUTION_LIMIT)) && RATING_DISTRIBUTION_LIMIT > 0
-      ? Math.max(1, Math.floor(Number(RATING_DISTRIBUTION_LIMIT)))
-      : 5;
-  const decimalPlaces = (() => {
-    const normalized = String(precision);
-    const dotIndex = normalized.indexOf('.');
-    return dotIndex === -1 ? 0 : normalized.length - dotIndex - 1;
-  })();
-  const bucketCounts = new Map();
-  const clampValue = value => Math.max(0, Math.min(10, value));
-  const safeFloor = value => Math.floor((value + precision * 1e-8) / precision);
-  movies.forEach(movie => {
-    const rawScore =
-      Number(movie.score ?? movie.vote_average ?? movie.voteAverage ?? movie.rating);
-    if (!Number.isFinite(rawScore)) return;
-    const clamped = clampValue(rawScore);
-    let bucketValue = safeFloor(clamped) * precision;
-    if (bucketValue > 10) bucketValue = 10;
-    const labelValue = Number(bucketValue.toFixed(decimalPlaces));
-    bucketCounts.set(labelValue, (bucketCounts.get(labelValue) || 0) + 1);
-  });
-  if (!bucketCounts.size) return [];
-  return Array.from(bucketCounts.entries())
-    .sort((a, b) => b[0] - a[0])
-    .slice(0, limit)
-    .map(([value, count]) => ({
-      label: Number(value).toFixed(decimalPlaces),
-      count
-    }));
-}
-
-function applyFeedFiltersWithOverrides(movies, overrides = {}) {
-  if (!Array.isArray(movies) || !movies.length) return [];
-  const localState = {
-    ...feedFilterState,
-    ...overrides
-  };
-
-  const minRating = getFilterFloat(localState.minRating, 0, 10);
-  const minVotes = getFilterInt(localState.minVotes, 0);
-  let startYear = getFilterInt(localState.startYear, 1800, 3000);
-  let endYear = getFilterInt(localState.endYear, 1800, 3000);
-
-  if (startYear != null && endYear != null && endYear < startYear) {
-    const temp = startYear;
-    startYear = endYear;
-    endYear = temp;
-  }
-
-  const genreMode = getGenreSelectionMode();
-  const selectedGenres = getSelectedGenreIdSet();
-  const disallowedGenres = getDisallowedGenreIdSet();
-  const genreDataAvailable = movies.some(movie => getMovieGenreIdSet(movie).size > 0);
-  const filterByGenres = genreDataAvailable && genreMode === 'custom' && selectedGenres.size > 0;
-  const enforceDisallowed = genreDataAvailable && disallowedGenres.size > 0;
-
-  return movies.filter(movie => {
-    if (minRating != null) {
-      const rating = getVoteAverageValue(movie);
-      if (rating == null || rating < minRating) {
-        return false;
-      }
-    }
-
-    if (minVotes != null) {
-      const votes = getVoteCountValue(movie);
-      if (votes == null || votes < minVotes) {
-        return false;
-      }
-    }
-
-    if (startYear != null || endYear != null) {
-      const year = getMovieReleaseYear(movie);
-      if (startYear != null && (year == null || year < startYear)) {
-        return false;
-      }
-      if (endYear != null && (year == null || year > endYear)) {
-        return false;
-      }
-    }
-
-    if (filterByGenres) {
-      const ids = getMovieGenreIdSet(movie);
-      if (!ids.size) {
-        return false;
-      }
-      let matches = false;
-      for (const selectedId of selectedGenres) {
-        if (ids.has(selectedId)) {
-          matches = true;
-          break;
-        }
-      }
-      if (!matches) {
-        return false;
-      }
-    }
-
-    if (enforceDisallowed) {
-      const ids = getMovieGenreIdSet(movie);
-      if (ids.size) {
-        for (const disallowedId of disallowedGenres) {
-          if (ids.has(disallowedId)) {
-            return false;
-          }
-        }
-      }
-    }
-
-    return true;
-  });
-}
-
-function ensureRatingDistributionData() {
-  if (Array.isArray(ratingDistributionData) && ratingDistributionData.length) {
-    return Promise.resolve(ratingDistributionData);
-  }
-  if (!pendingRatingDistributionPromise) {
-    const excludeIds = getClassifiedMovieIds()
-      .map(id => id)
-      .filter(Boolean);
-    const params = new URLSearchParams();
-    params.set('cacheOnly', '1');
-    params.set('ratingPrecision', String(RATING_DISTRIBUTION_PRECISION));
-    params.set('ratingTop', String(RATING_DISTRIBUTION_LIMIT));
-    if (excludeIds.length) {
-      params.set('excludeIds', excludeIds.join(','));
-    }
-    const statsUrl = buildMoviesApiUrl('/api/movies/stats');
-    const request = fetch(`${statsUrl}?${params.toString()}`)
-      .then(res => {
-        if (!res.ok) {
-          throw new Error(`Rating distribution request failed (${res.status})`);
-        }
-        return res.json();
-      })
-      .then(data => {
-        const list = Array.isArray(data?.ratingDistribution) ? data.ratingDistribution : [];
-        if (list.length) {
-          ratingDistributionData = list;
-          return list;
-        }
-        const fallback = buildLocalRatingDistribution();
-        ratingDistributionData = fallback;
-        return fallback;
-      })
-      .catch(err => {
-        const fallback = buildLocalRatingDistribution();
-        ratingDistributionData = fallback;
-        console.warn('Failed to load rating distribution', err);
-        return fallback;
-      })
-      .finally(() => {
-        pendingRatingDistributionPromise = null;
-      });
-    pendingRatingDistributionPromise = request;
-  }
-  return pendingRatingDistributionPromise;
-}
-
 function hasActiveFeedFilters() {
   const { minRating, minVotes, startYear, endYear } = feedFilterState;
   if (
@@ -2207,7 +2076,7 @@ function makeActionButton(label, handler, options = {}) {
   btn.className = 'movie-action';
   btn.textContent = label;
   const pendingLabel = options.pendingLabel || 'Saving...';
-  btn.addEventListener('click', async () => {
+  const runAction = async () => {
     if (btn.disabled) return;
     const originalLabel = btn.textContent;
     btn.disabled = true;
@@ -2226,6 +2095,24 @@ function makeActionButton(label, handler, options = {}) {
       btn.classList.remove('movie-action--loading');
       btn.textContent = originalLabel;
     }
+  };
+
+  let suppressClickUntil = 0;
+  btn.addEventListener('pointerup', event => {
+    const pointerType = typeof event.pointerType === 'string' ? event.pointerType : '';
+    if (pointerType !== 'touch' && pointerType !== 'pen') return;
+    if (typeof event.button === 'number' && event.button !== 0) return;
+    // Some touch browsers can intermittently drop synthetic click events.
+    suppressClickUntil = Date.now() + 700;
+    event.preventDefault();
+    void runAction();
+  });
+
+  btn.addEventListener('click', () => {
+    if (suppressClickUntil && Date.now() <= suppressClickUntil) {
+      return;
+    }
+    void runAction();
   });
   return btn;
 }
@@ -2437,25 +2324,224 @@ function getMovieReleaseYear(movie) {
   return Number.isFinite(year) ? year : null;
 }
 
-function resolvePosterPath(movie) {
-  if (movie?.poster_path) return movie.poster_path;
-  if (movie?.backdrop_path) return movie.backdrop_path;
+function normalizeImageCandidatePath(value) {
+  if (typeof value !== 'string') return '';
+  const trimmed = value.trim();
+  if (!trimmed) return '';
+  if (/\s/.test(trimmed)) return '';
+  const lowered = trimmed.toLowerCase();
+  if (
+    lowered === 'n/a' ||
+    lowered === 'na' ||
+    lowered === 'null' ||
+    lowered === 'undefined' ||
+    lowered === 'none'
+  ) {
+    return '';
+  }
+  if (/^https?:\/\//i.test(trimmed)) {
+    return trimmed;
+  }
+  if (trimmed.includes('..')) return '';
+  const normalized = trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
+  return normalized;
+}
+
+function normalizeTitleForMatching(value) {
+  if (typeof value !== 'string') return '';
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+function getMovieYearForMatching(movie) {
+  if (!movie || typeof movie !== 'object') return null;
+  const raw = String(movie.release_date || movie.releaseDate || movie.first_air_date || '').trim();
+  if (!raw) return null;
+  const year = Number.parseInt(raw.slice(0, 4), 10);
+  return Number.isFinite(year) ? year : null;
+}
+
+function resolvePosterCandidates(movie) {
+  const candidates = [];
+  const pushCandidate = path => {
+    const normalized = normalizeImageCandidatePath(path);
+    if (!normalized || candidates.includes(normalized)) return;
+    candidates.push(normalized);
+  };
   const idValue = movie?.id ?? movie?.movieId ?? movie?.movieID ?? null;
-  if (idValue == null) return '';
+  if (idValue != null) {
+    const key = String(idValue);
+    const restored = restoredMoviesById.get(key);
+    pushCandidate(restored?.poster_path);
+    pushCandidate(restored?.backdrop_path);
+    if (Array.isArray(currentMovies)) {
+      const match = currentMovies.find(item => String(item?.id) === key);
+      pushCandidate(match?.poster_path);
+      pushCandidate(match?.backdrop_path);
+    }
+  }
+  pushCandidate(movie?.poster_path);
+  pushCandidate(movie?.backdrop_path);
+  return candidates;
+}
+
+function resolvePosterPath(movie) {
+  return resolvePosterCandidates(movie)[0] || '';
+}
+
+function hasCanonicalPosterCandidate(movie) {
+  const idValue = movie?.id ?? movie?.movieId ?? movie?.movieID ?? null;
+  if (idValue == null) return false;
   const key = String(idValue);
   const restored = restoredMoviesById.get(key);
-  if (restored?.poster_path) return restored.poster_path;
-  if (restored?.backdrop_path) return restored.backdrop_path;
+  if (
+    normalizeImageCandidatePath(restored?.poster_path) ||
+    normalizeImageCandidatePath(restored?.backdrop_path)
+  ) {
+    return true;
+  }
   if (Array.isArray(currentMovies)) {
     const match = currentMovies.find(item => String(item?.id) === key);
-    if (match?.poster_path) return match.poster_path;
-    if (match?.backdrop_path) return match.backdrop_path;
+    if (
+      normalizeImageCandidatePath(match?.poster_path) ||
+      normalizeImageCandidatePath(match?.backdrop_path)
+    ) {
+      return true;
+    }
   }
-  return '';
+  return false;
+}
+
+function pickPosterRecoveryCandidate(targetMovie, response) {
+  if (!targetMovie || !response || typeof response !== 'object') return null;
+  const pools = [];
+  if (Array.isArray(response.results)) pools.push(...response.results);
+  if (Array.isArray(response.curated)) pools.push(...response.curated);
+  if (Array.isArray(response.fresh)) pools.push(...response.fresh);
+  const unique = new Map();
+  pools.forEach(movie => {
+    if (!movie || movie.id == null) return;
+    const key = String(movie.id);
+    if (!unique.has(key)) {
+      unique.set(key, movie);
+    }
+  });
+  const withImages = Array.from(unique.values()).filter(
+    movie =>
+      Boolean(normalizeImageCandidatePath(movie?.poster_path)) ||
+      Boolean(normalizeImageCandidatePath(movie?.backdrop_path))
+  );
+  if (!withImages.length) return null;
+
+  const targetId = targetMovie?.id != null ? String(targetMovie.id) : null;
+  if (targetId) {
+    const byId = withImages.find(movie => String(movie?.id) === targetId);
+    if (byId) return byId;
+  }
+
+  const targetTitle = normalizeTitleForMatching(targetMovie?.title || targetMovie?.name || '');
+  const targetYear = getMovieYearForMatching(targetMovie);
+  if (targetTitle) {
+    const exact = withImages.find(movie => {
+      const candidateTitle = normalizeTitleForMatching(movie?.title || movie?.name || '');
+      if (candidateTitle !== targetTitle) return false;
+      if (targetYear == null) return true;
+      const candidateYear = getMovieYearForMatching(movie);
+      return candidateYear == null || candidateYear === targetYear;
+    });
+    if (exact) return exact;
+  }
+  return null;
+}
+
+async function recoverPosterForMovie(movie) {
+  if (!isPosterRecoveryEnabled()) return null;
+  const idValue = movie?.id ?? movie?.movieId ?? movie?.movieID ?? null;
+  if (idValue == null) return null;
+  const key = String(idValue);
+  if (attemptedPosterRecoveryIds.has(key)) {
+    return null;
+  }
+  if (pendingPosterRecoveryById.has(key)) {
+    return pendingPosterRecoveryById.get(key);
+  }
+  attemptedPosterRecoveryIds.add(key);
+
+  const promise = (async () => {
+    try {
+      const title = typeof movie?.title === 'string' ? movie.title.trim() : '';
+      if (!title) return null;
+      const params = new URLSearchParams();
+      params.set('q', title);
+      params.set('limit', '25');
+      params.set('minScore', '0');
+      params.set('includeFresh', '1');
+      const url = `${buildMoviesApiUrl('/api/movies')}?${params.toString()}`;
+      const res = await fetch(url);
+      if (!res.ok) return null;
+      const data = await res.json();
+      const candidate = pickPosterRecoveryCandidate(movie, data);
+      if (!candidate) return null;
+
+      const posterPath = normalizeImageCandidatePath(candidate.poster_path);
+      const backdropPath = normalizeImageCandidatePath(candidate.backdrop_path);
+      if (!posterPath && !backdropPath) return null;
+
+      if (!normalizeImageCandidatePath(movie.poster_path) && posterPath) {
+        movie.poster_path = posterPath;
+      }
+      if (!normalizeImageCandidatePath(movie.backdrop_path) && backdropPath) {
+        movie.backdrop_path = backdropPath;
+      }
+
+      const restored = captureRestoredMovie(movie);
+      if (restored) {
+        restoredMoviesById.set(key, restored);
+      }
+
+      const prefEntry = currentPrefs?.[key];
+      if (prefEntry && prefEntry.movie) {
+        const nextMovie = { ...prefEntry.movie };
+        let changed = false;
+        if (!normalizeImageCandidatePath(nextMovie.poster_path) && posterPath) {
+          nextMovie.poster_path = posterPath;
+          changed = true;
+        }
+        if (!normalizeImageCandidatePath(nextMovie.backdrop_path) && backdropPath) {
+          nextMovie.backdrop_path = backdropPath;
+          changed = true;
+        }
+        if (changed) {
+          const nextPrefs = {
+            ...currentPrefs,
+            [key]: {
+              ...prefEntry,
+              movie: nextMovie
+            }
+          };
+          await savePreferences(nextPrefs);
+        }
+      }
+
+      refreshUI();
+      return posterPath || backdropPath || null;
+    } catch (err) {
+      console.warn('Failed to recover movie poster', key, err);
+      return null;
+    }
+  })().finally(() => {
+    pendingPosterRecoveryById.delete(key);
+  });
+
+  pendingPosterRecoveryById.set(key, promise);
+  return promise;
 }
 
 function buildImageUrl(path) {
-  if (!path) return '';
+  const normalizedInput = normalizeImageCandidatePath(path);
+  if (!normalizedInput) return '';
   const imageProxyBase = buildMoviesApiUrl('/api/movie-image');
   const buildProxyUrl = (imagePath, size = 'w200') => {
     if (!imagePath) return '';
@@ -2467,9 +2553,9 @@ function buildImageUrl(path) {
     return `${imageProxyBase}?${params.toString()}`;
   };
 
-  if (/^https?:\/\//i.test(path)) {
+  if (/^https?:\/\//i.test(normalizedInput)) {
     try {
-      const parsed = new URL(path);
+      const parsed = new URL(normalizedInput);
       if (parsed.hostname === 'image.tmdb.org') {
         const match = parsed.pathname.match(/^\/t\/p\/([^/]+)(\/.+)$/);
         if (match) {
@@ -2479,21 +2565,76 @@ function buildImageUrl(path) {
     } catch (_) {
       // Ignore parse errors and keep the original URL for non-TMDB images.
     }
-    return path;
+    return normalizedInput;
   }
 
-  const normalizedPath = path.startsWith('/') ? path : `/${path}`;
+  const normalizedPath = normalizedInput.startsWith('/') ? normalizedInput : `/${normalizedInput}`;
   return buildProxyUrl(normalizedPath, 'w200');
 }
 
-function setPosterImageSource(img, posterPath) {
+function setPosterImageSource(img, posterPaths, options = {}) {
   if (!img) return;
-  const proxiedSrc = buildImageUrl(posterPath);
-  if (!proxiedSrc) return;
-  img.src = proxiedSrc;
-  img.addEventListener('error', () => {
+  const candidates = [];
+  const queue = Array.isArray(posterPaths) ? posterPaths : [posterPaths];
+  queue.forEach(path => {
+    const normalized = normalizeImageCandidatePath(path);
+    if (!normalized || candidates.includes(normalized)) return;
+    candidates.push(normalized);
+  });
+  if (!candidates.length) return;
+
+  const onExhausted = typeof options?.onExhausted === 'function' ? options.onExhausted : null;
+  let index = 0;
+  const cleanup = () => {
+    img.removeEventListener('error', handleError);
+    img.removeEventListener('load', handleLoad);
+  };
+  const applyNext = () => {
+    while (index < candidates.length) {
+      const nextPath = candidates[index];
+      index += 1;
+      const proxiedSrc = buildImageUrl(nextPath);
+      if (!proxiedSrc) continue;
+      img.src = proxiedSrc;
+      return true;
+    }
+    cleanup();
     img.removeAttribute('src');
-  }, { once: true });
+    if (onExhausted) onExhausted();
+    return false;
+  };
+  const handleError = () => {
+    applyNext();
+  };
+  const handleLoad = () => {
+    cleanup();
+  };
+  img.addEventListener('error', handleError);
+  img.addEventListener('load', handleLoad);
+  applyNext();
+}
+
+function appendMovieCardPoster(li, movie) {
+  if (!li || !movie) return;
+  const posterCandidates = resolvePosterCandidates(movie);
+  const hasCanonicalPoster = hasCanonicalPosterCandidate(movie);
+  if (!posterCandidates.length) {
+    void recoverPosterForMovie(movie);
+    return;
+  }
+  if (!hasCanonicalPoster) {
+    // Refresh stale saved snapshots in the background using strict ID/title matching.
+    void recoverPosterForMovie(movie);
+  }
+
+  const img = document.createElement('img');
+  setPosterImageSource(img, posterCandidates, {
+    onExhausted: () => {
+      void recoverPosterForMovie(movie);
+    }
+  });
+  img.alt = `${movie.title || movie.name || 'Movie'} poster`;
+  li.appendChild(img);
 }
 
 function getMovieGenreIdSet(movie) {
@@ -2962,7 +3103,6 @@ async function setStatus(movie, status, options = {}) {
   }
   await loadPreferences();
   const id = String(movie.id);
-  restoredMoviesById.delete(id);
   const next = { ...currentPrefs };
   const snapshot = summarizeMovie(movie);
   const entry = next[id] ? { ...next[id] } : {};
@@ -3149,13 +3289,7 @@ function createMovieCardElement(movie) {
     li.dataset.movieId = String(movie.id);
   }
 
-  const posterPath = resolvePosterPath(movie);
-  if (posterPath) {
-    const img = document.createElement('img');
-    setPosterImageSource(img, posterPath);
-    img.alt = `${movie.title || movie.name || 'Movie'} poster`;
-    li.appendChild(img);
-  }
+  appendMovieCardPoster(li, movie);
 
   const info = document.createElement('div');
   info.className = 'movie-info';
@@ -3288,6 +3422,9 @@ function renderFeed() {
     buildCatalogLoadStatusMessage(availableMovies.length, filteredMovies.length),
     { tone: 'success', location: 'top' }
   );
+  if (isElementVisibleForAutoFetch(domRefs.streamSection)) {
+    enqueueAutoCriticScores(filteredMovies);
+  }
 
   updateFeedStatus('', { tone: 'success', location: 'bottom' });
 }
@@ -3297,9 +3434,38 @@ function renderInterestedList() {
   const listEl = domRefs.interestedList;
   if (!listEl) return;
 
-  const allEntries = Object.values(currentPrefs)
-    .filter(pref => pref.status === 'interested' && pref.movie)
-    .sort((a, b) => (b.interest ?? 0) - (a.interest ?? 0) || (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
+  const interestedEntries = Object.values(currentPrefs).filter(
+    pref => pref.status === 'interested' && pref.movie
+  );
+  const blendCache = new Map();
+  const getBlend = pref => {
+    const key = String(pref?.movie?.id ?? `${pref?.movie?.title || ''}|${pref?.updatedAt || ''}`);
+    if (blendCache.has(key)) {
+      return blendCache.get(key);
+    }
+    const blend = computeWeightedCriticBlend(pref?.movie);
+    blendCache.set(key, blend);
+    return blend;
+  };
+  const allEntries = interestedEntries.sort((a, b) => {
+    const aBlend = getBlend(a);
+    const bBlend = getBlend(b);
+    const aHasBlend = Number.isFinite(aBlend.value);
+    const bHasBlend = Number.isFinite(bBlend.value);
+    if (aHasBlend && bHasBlend && bBlend.value !== aBlend.value) {
+      return bBlend.value - aBlend.value;
+    }
+    if (aHasBlend !== bHasBlend) {
+      return aHasBlend ? -1 : 1;
+    }
+    if (bBlend.signalCount !== aBlend.signalCount) {
+      return bBlend.signalCount - aBlend.signalCount;
+    }
+    if (bBlend.weightUsed !== aBlend.weightUsed) {
+      return bBlend.weightUsed - aBlend.weightUsed;
+    }
+    return (b.interest ?? 0) - (a.interest ?? 0) || (b.updatedAt ?? 0) - (a.updatedAt ?? 0);
+  });
 
   const genres = [];
   allEntries.forEach(pref => {
@@ -3347,13 +3513,7 @@ function renderInterestedList() {
     const li = document.createElement('li');
     li.className = 'movie-card';
 
-    const posterPath = resolvePosterPath(movie);
-    if (posterPath) {
-      const img = document.createElement('img');
-      setPosterImageSource(img, posterPath);
-      img.alt = `${movie.title || 'Movie'} poster`;
-      li.appendChild(img);
-    }
+    appendMovieCardPoster(li, movie);
 
     const info = document.createElement('div');
     info.className = 'movie-info';
@@ -3425,6 +3585,9 @@ function renderInterestedList() {
 
   listEl.innerHTML = '';
   listEl.appendChild(ul);
+  if (isElementVisibleForAutoFetch(domRefs.interestedSection)) {
+    enqueueAutoCriticScores(entries.map(pref => pref.movie).filter(Boolean));
+  }
 }
 
 function renderWatchedList() {
@@ -3516,13 +3679,7 @@ function renderWatchedList() {
     const li = document.createElement('li');
     li.className = 'movie-card';
 
-    const posterPath = resolvePosterPath(movie);
-    if (posterPath) {
-      const img = document.createElement('img');
-      setPosterImageSource(img, posterPath);
-      img.alt = `${movie.title || 'Movie'} poster`;
-      li.appendChild(img);
-    }
+    appendMovieCardPoster(li, movie);
 
     const info = document.createElement('div');
     info.className = 'movie-info';
@@ -3606,6 +3763,9 @@ function renderWatchedList() {
 
   listEl.innerHTML = '';
   listEl.appendChild(container);
+  if (isElementVisibleForAutoFetch(domRefs.watchedSection)) {
+    enqueueAutoCriticScores(sorted.map(pref => pref.movie).filter(Boolean));
+  }
 }
 
 function refreshUI() {
@@ -3747,7 +3907,6 @@ function mergeRestoredMovies(baseMovies) {
   let modified = false;
   restoredMoviesById.forEach((movie, key) => {
     if (isMovieSuppressed(key)) {
-      restoredMoviesById.delete(key);
       return;
     }
     if (existingById.has(key)) {
@@ -4149,6 +4308,24 @@ function collectMoviesFromCache(results, suppressedIds) {
   return applyPriorityOrdering(collected);
 }
 
+function mergeRestoredMoviesFromCatalogResults(results) {
+  (Array.isArray(results) ? results : []).forEach(movie => {
+    const normalized = normalizeCachedMovie(movie);
+    if (!normalized || normalized.id == null) return;
+    const candidate = captureRestoredMovie(normalized);
+    if (!candidate || candidate.id == null) return;
+    const key = String(candidate.id);
+    const existing = restoredMoviesById.get(key);
+    if (!existing) {
+      restoredMoviesById.set(key, candidate);
+      return;
+    }
+    if (scoreMovieForMerge(candidate) > scoreMovieForMerge(existing)) {
+      restoredMoviesById.set(key, candidate);
+    }
+  });
+}
+
 async function tryFetchCachedMovies({ suppressedIds, excludeIds }) {
   try {
     const params = new URLSearchParams();
@@ -4179,6 +4356,7 @@ async function tryFetchCachedMovies({ suppressedIds, excludeIds }) {
     if (metadata) {
       lastCatalogMetadata = metadata;
     }
+    mergeRestoredMoviesFromCatalogResults(data?.results);
     const prioritized = collectMoviesFromCache(data?.results, suppressedIds);
     return {
       movies: prioritized,
@@ -4595,9 +4773,6 @@ export async function initMoviesPanel() {
   domRefs.feedEndYear = doc.getElementById('movieFilterEndYear');
   domRefs.feedGenre = doc.getElementById('movieFilterGenre');
   domRefs.unclassifiedCount = doc.getElementById('movieUnclassifiedCount');
-  domRefs.ratingDistributionToggle = doc.getElementById('movieRatingToggle');
-  domRefs.ratingDistributionPanel = doc.getElementById('movieRatingPanel');
-  domRefs.ratingDistributionList = doc.getElementById('movieRatingList');
 
   updateMovieStats();
 
@@ -4657,14 +4832,6 @@ export async function initMoviesPanel() {
 
   if (domRefs.apiKeyContainer && getTmdbProxyEndpoint()) {
     domRefs.apiKeyContainer.style.display = 'none';
-  }
-
-  if (domRefs.ratingDistributionToggle) {
-    domRefs.ratingDistributionToggle.removeEventListener(
-      'click',
-      handleRatingDistributionToggle
-    );
-    domRefs.ratingDistributionToggle.addEventListener('click', handleRatingDistributionToggle);
   }
 
   if (domRefs.tabs) {
@@ -4741,8 +4908,6 @@ export async function refreshMoviesPanelForAuthChange(user = null) {
   serverMovieStats = null;
   pendingMovieStatsPromise = null;
   lastFetchedMovieStatsSignature = null;
-  ratingDistributionData = null;
-  pendingRatingDistributionPromise = null;
   lastRenderedFilterSignature = '';
   lastRenderedMovieIds = [];
 

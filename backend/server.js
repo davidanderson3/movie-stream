@@ -13,11 +13,13 @@ const express = require('express');
 const { Configuration, PlaidApi, PlaidEnvironments } = require('plaid');
 const cors = require('cors');
 const {
+  buildCacheId,
   readCachedResponse,
   writeCachedResponse,
   getCacheBackendStatus,
   probeFirestoreWrite
 } = require('../shared/cache');
+const { getFirestore, serverTimestamp } = require('../shared/firestore');
 const movieCatalog = require('./movie-catalog');
 let nodemailer;
 try {
@@ -53,6 +55,7 @@ const OMDB_API_KEY =
   '';
 const OMDB_CACHE_COLLECTION = 'omdbRatings';
 const OMDB_CACHE_TTL_MS = 1000 * 60 * 60 * 12; // 12 hours
+const OMDB_SCORES_COLLECTION = 'movieCriticScores';
 const OMDB_PREFETCH_STATE_COLLECTION = 'omdbRatingsPrefetch';
 const OMDB_PREFETCH_STATE_KEY = ['state', 'v1'];
 const OMDB_PREFETCH_DEFAULT_DELAY_MS = Math.max(
@@ -114,50 +117,6 @@ const omdbPrefetchRuntime = {
   progress: null,
   lastError: null
 };
-
-function buildRatingPrecisionDistribution(movies, precision, limit = 5) {
-  const normalizedPrecision = Number(precision);
-  if (!Number.isFinite(normalizedPrecision) || normalizedPrecision <= 0) {
-    return [];
-  }
-
-  const decimalPlaces = (() => {
-    const str = String(normalizedPrecision);
-    const dotIndex = str.indexOf('.');
-    if (dotIndex === -1) return 0;
-    return str.length - dotIndex - 1;
-  })();
-
-  const clamp = value => Math.min(10, Math.max(0, value));
-  const bucketCounts = new Map();
-
-  const safeFloor = value => {
-    return Math.floor((value + normalizedPrecision * 1e-8) / normalizedPrecision);
-  };
-
-  (Array.isArray(movies) ? movies : []).forEach(movie => {
-    const score = Number(movie?.score);
-    if (!Number.isFinite(score)) return;
-    const clamped = clamp(score);
-    const bucketIndex = safeFloor(clamped);
-    let bucketValue = bucketIndex * normalizedPrecision;
-    if (bucketValue > 10) bucketValue = 10;
-    const bucketKey = Number(bucketValue.toFixed(decimalPlaces));
-    bucketCounts.set(bucketKey, (bucketCounts.get(bucketKey) || 0) + 1);
-  });
-
-  if (!bucketCounts.size) return [];
-
-  const limited = Array.from(bucketCounts.entries())
-    .map(([value, count]) => ({ value, count }))
-    .sort((a, b) => b.value - a.value)
-    .slice(0, Math.max(1, Number(limit) || 1));
-
-  return limited.map(({ value, count }) => ({
-    label: value.toFixed(decimalPlaces),
-    count
-  }));
-}
 
 async function safeReadCachedResponse(collection, keyParts, ttlMs) {
   try {
@@ -758,6 +717,131 @@ function normalizeOmdbPayload(data, { type, requestedTitle, requestedYear }) {
   return payload;
 }
 
+function normalizePersistedOmdbPayload(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const ratingsRaw = raw.ratings && typeof raw.ratings === 'object' ? raw.ratings : {};
+  const payload = {
+    source: 'omdb',
+    ratings: {
+      rottenTomatoes: parseOmdbPercent(ratingsRaw.rottenTomatoes),
+      metacritic: parseOmdbScore(ratingsRaw.metacritic),
+      imdb: parseOmdbImdbRating(ratingsRaw.imdb)
+    },
+    imdbId: sanitizeOmdbString(raw.imdbId || raw.imdbID) || null,
+    title: sanitizeOmdbString(raw.title) || null,
+    year: sanitizeOmdbString(raw.year) || null,
+    type: sanitizeOmdbString(raw.type) || null,
+    fetchedAt:
+      typeof raw.fetchedAt === 'string' && raw.fetchedAt.trim()
+        ? raw.fetchedAt
+        : new Date().toISOString()
+  };
+  const hasScore =
+    Number.isFinite(payload.ratings.rottenTomatoes) ||
+    Number.isFinite(payload.ratings.metacritic) ||
+    Number.isFinite(payload.ratings.imdb);
+  if (!hasScore) return null;
+  return payload;
+}
+
+function buildOmdbScoreDocId({ imdbId, title, year, type }) {
+  const parts = buildOmdbCacheKeyParts({
+    imdbId,
+    title,
+    year,
+    type: type || 'any'
+  });
+  return buildCacheId(['omdb-scores', ...parts]);
+}
+
+function buildOmdbLookupVariants({ imdbId, title, year, type, payload }) {
+  const variants = [];
+  const seen = new Set();
+  const addVariant = (nextImdbId, nextTitle, nextYear, nextType) => {
+    const normalized = {
+      imdbId: sanitizeOmdbString(nextImdbId || ''),
+      title: sanitizeOmdbString(nextTitle || ''),
+      year: sanitizeOmdbString(nextYear || ''),
+      type: sanitizeOmdbString(nextType || '') || 'movie'
+    };
+    if (!normalized.imdbId && !normalized.title) return;
+    const key = `${normalized.imdbId}|${normalized.title.toLowerCase()}|${normalized.year}|${normalized.type}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    variants.push(normalized);
+  };
+
+  addVariant(imdbId, title, year, type);
+  if (payload) {
+    addVariant(payload.imdbId, '', payload.year || year, payload.type || type);
+    addVariant('', payload.title, payload.year || year, payload.type || type);
+  }
+  return variants;
+}
+
+async function readOmdbPayloadFromDb({ imdbId, title, year, type }) {
+  const db = getFirestore();
+  if (!db) return null;
+  const docId = buildOmdbScoreDocId({ imdbId, title, year, type });
+  try {
+    const snap = await db.collection(OMDB_SCORES_COLLECTION).doc(docId).get();
+    if (!snap.exists) return null;
+    const data = snap.data() || {};
+    return normalizePersistedOmdbPayload(data.payload || data);
+  } catch (err) {
+    console.warn('Failed to read OMDb payload from Firestore', err?.message || err);
+    return null;
+  }
+}
+
+async function writeOmdbPayloadToDb(payload, { imdbId, title, year, type } = {}) {
+  const db = getFirestore();
+  if (!db || !payload || typeof payload !== 'object') return false;
+  const normalizedPayload = normalizePersistedOmdbPayload(payload);
+  if (!normalizedPayload) return false;
+  const variants = buildOmdbLookupVariants({
+    imdbId,
+    title,
+    year,
+    type,
+    payload: normalizedPayload
+  });
+  if (!variants.length) return false;
+
+  try {
+    await Promise.all(
+      variants.map(variant => {
+        const docId = buildOmdbScoreDocId(variant);
+        return db
+          .collection(OMDB_SCORES_COLLECTION)
+          .doc(docId)
+          .set(
+            {
+              lookup: {
+                imdbId: variant.imdbId || null,
+                title: variant.title || null,
+                year: variant.year || null,
+                type: variant.type || null
+              },
+              payload: normalizedPayload,
+              imdbId: normalizedPayload.imdbId || variant.imdbId || null,
+              title: normalizedPayload.title || variant.title || null,
+              year: normalizedPayload.year || variant.year || null,
+              type: normalizedPayload.type || variant.type || null,
+              source: 'omdb',
+              updatedAt: serverTimestamp()
+            },
+            { merge: true }
+          );
+      })
+    );
+    return true;
+  } catch (err) {
+    console.warn('Failed to write OMDb payload to Firestore', err?.message || err);
+    return false;
+  }
+}
+
 function wait(ms) {
   if (!Number.isFinite(ms) || ms <= 0) {
     return Promise.resolve();
@@ -876,6 +960,14 @@ async function lookupAndCacheOmdbRatings({
       OMDB_CACHE_TTL_MS
     );
     if (cached && typeof cached.body === 'string' && cached.body.length) {
+      try {
+        const cachedPayload = normalizePersistedOmdbPayload(JSON.parse(cached.body));
+        if (cachedPayload) {
+          await writeOmdbPayloadToDb(cachedPayload, { imdbId, title, year, type });
+        }
+      } catch (_) {
+        // Ignore cache parse errors and continue returning cache hits.
+      }
       return {
         outcome: 'cache_hit',
         cacheParts,
@@ -959,6 +1051,7 @@ async function lookupAndCacheOmdbRatings({
         type: payload.type || type || null
       }
     });
+    await writeOmdbPayloadToDb(payload, { imdbId, title, year, type });
 
     return {
       outcome: 'fetched',
@@ -1556,7 +1649,11 @@ app.get('/leaderboard', (req, res) => {
 
 app.get('/api/movies', async (req, res) => {
   try {
-    const query = typeof req.query.q === 'string' ? req.query.q : '';
+    const queryRaw =
+      (typeof req.query.q === 'string' && req.query.q) ||
+      (typeof req.query.query === 'string' && req.query.query) ||
+      '';
+    const query = String(queryRaw).trim();
     const limit = parseNumberQuery(req.query.limit) ?? DEFAULT_MOVIE_LIMIT;
     const freshLimit = parseNumberQuery(req.query.freshLimit);
     const minScore = parseNumberQuery(req.query.minScore);
@@ -1725,6 +1822,122 @@ app.post('/api/admin/refresh-movie-cache', async (req, res) => {
   }
 });
 
+app.get('/api/admin/missing-movie-images', async (req, res) => {
+  if (!ADMIN_REFRESH_TOKEN) {
+    return res.status(503).json({ error: 'admin_refresh_unconfigured' });
+  }
+  const token = readAdminToken(req);
+  if (!token || token !== ADMIN_REFRESH_TOKEN) {
+    return res.status(401).json({ error: 'admin_refresh_unauthorized' });
+  }
+
+  const sampleSize =
+    normalizePositiveInteger(req.query.sampleSize, { min: 1, max: 500 }) || 25;
+  const refreshIfEmpty =
+    req.query.refreshIfEmpty === undefined
+      ? true
+      : parseBooleanQuery(req.query.refreshIfEmpty);
+
+  let catalogState = await movieCatalog.ensureCatalog({
+    allowStale: true,
+    cacheOnly: !refreshIfEmpty
+  });
+
+  if (refreshIfEmpty && !(Array.isArray(catalogState?.movies) && catalogState.movies.length)) {
+    catalogState = await movieCatalog.ensureCatalog({
+      forceRefresh: true,
+      allowStale: false,
+      cacheOnly: false,
+      bypassRangeCache: true
+    });
+  }
+
+  const report = movieCatalog.getMissingImageStats({ sampleSize });
+  res.json({
+    ok: true,
+    ...report,
+    catalogUpdatedAt:
+      catalogState?.metadata?.updatedAt ||
+      (catalogState?.updatedAt
+        ? new Date(catalogState.updatedAt).toISOString()
+        : null),
+    source: catalogState?.metadata?.source || null
+  });
+});
+
+app.post('/api/admin/backfill-movie-images', async (req, res) => {
+  if (!ADMIN_REFRESH_TOKEN) {
+    return res.status(503).json({ error: 'admin_refresh_unconfigured' });
+  }
+  const token = readAdminToken(req);
+  if (!token || token !== ADMIN_REFRESH_TOKEN) {
+    return res.status(401).json({ error: 'admin_refresh_unauthorized' });
+  }
+
+  const payload = req.body && typeof req.body === 'object' ? req.body : {};
+  const sampleSize =
+    normalizePositiveInteger(payload.sampleSize ?? req.query.sampleSize, {
+      min: 1,
+      max: 500
+    }) || 25;
+  const refreshIfEmpty =
+    payload.refreshIfEmpty === undefined && req.query.refreshIfEmpty === undefined
+      ? true
+      : parseBooleanQuery(payload.refreshIfEmpty ?? req.query.refreshIfEmpty);
+  const dryRun = parseBooleanQuery(payload.dryRun ?? req.query.dryRun);
+
+  const rawLimit = parseNumberQuery(payload.limit ?? req.query.limit);
+  const limit =
+    Number.isFinite(rawLimit) && rawLimit > 0 ? Math.max(1, Math.floor(rawLimit)) : 0;
+  const rawDelayMs = parseNumberQuery(payload.delayMs ?? req.query.delayMs);
+  const delayMs =
+    Number.isFinite(rawDelayMs) && rawDelayMs >= 0
+      ? Math.min(10000, Math.floor(rawDelayMs))
+      : 200;
+
+  let catalogState = await movieCatalog.ensureCatalog({
+    allowStale: true,
+    cacheOnly: !refreshIfEmpty
+  });
+  if (refreshIfEmpty && !(Array.isArray(catalogState?.movies) && catalogState.movies.length)) {
+    catalogState = await movieCatalog.ensureCatalog({
+      forceRefresh: true,
+      allowStale: false,
+      cacheOnly: false,
+      bypassRangeCache: true
+    });
+  }
+
+  const before = movieCatalog.getMissingImageStats({ sampleSize });
+  if (dryRun) {
+    return res.json({
+      ok: true,
+      dryRun: true,
+      options: {
+        limit,
+        delayMs
+      },
+      before
+    });
+  }
+
+  const backfill = await movieCatalog.backfillMissingPosters({ limit, delayMs });
+  const refreshedState = await movieCatalog.ensureCatalog({ allowStale: true, cacheOnly: true });
+  const after = movieCatalog.getMissingImageStats({ sampleSize });
+  return res.json({
+    ok: true,
+    before,
+    backfill,
+    after,
+    catalogUpdatedAt:
+      refreshedState?.metadata?.updatedAt ||
+      (refreshedState?.updatedAt
+        ? new Date(refreshedState.updatedAt).toISOString()
+        : null),
+    source: refreshedState?.metadata?.source || null
+  });
+});
+
 app.get('/api/admin/prefetch-movie-ratings', async (req, res) => {
   if (!ADMIN_REFRESH_TOKEN) {
     return res.status(503).json({ error: 'admin_refresh_unconfigured' });
@@ -1864,16 +2077,6 @@ app.get('/api/movies/stats', async (req, res) => {
       }
     });
 
-    const ratingPrecision =
-      parseNumberQuery(req.query.ratingPrecision ?? req.query.precision) ?? null;
-    const ratingTop =
-      parseNumberQuery(req.query.ratingTop ?? req.query.top) ?? 5;
-
-    const ratingDistribution =
-      ratingPrecision && ratingTop
-        ? buildRatingPrecisionDistribution(movies, ratingPrecision, ratingTop)
-        : [];
-
     res.json({
       total,
       catalogTotal: movies.length,
@@ -1882,8 +2085,7 @@ app.get('/api/movies/stats', async (req, res) => {
         (catalogState?.updatedAt
           ? new Date(catalogState.updatedAt).toISOString()
           : null),
-      buckets: bucketStats.map(({ label, count }) => ({ label, count })),
-      ratingDistribution
+      buckets: bucketStats.map(({ label, count }) => ({ label, count }))
     });
   } catch (err) {
     console.error('Failed to compute movie stats', err);
@@ -1924,13 +2126,39 @@ app.get('/api/movie-ratings', async (req, res) => {
   });
 
   if (!forceRefresh) {
+    const persisted = await readOmdbPayloadFromDb({ imdbId, title, year, type });
+    if (persisted) {
+      const body = JSON.stringify(persisted);
+      await safeWriteCachedResponse(OMDB_CACHE_COLLECTION, cacheParts, {
+        body,
+        metadata: {
+          imdbId: persisted.imdbId || imdbId || null,
+          title: persisted.title || title || null,
+          year: persisted.year || year || null,
+          type: persisted.type || type || null
+        }
+      });
+      return res.json(persisted);
+    }
+
     const cached = await safeReadCachedResponse(
       OMDB_CACHE_COLLECTION,
       cacheParts,
       OMDB_CACHE_TTL_MS
     );
-    if (sendCachedResponse(res, cached)) {
-      return;
+    if (cached && typeof cached.body === 'string' && cached.body.length) {
+      try {
+        const cachedPayload = normalizePersistedOmdbPayload(JSON.parse(cached.body));
+        if (cachedPayload) {
+          await writeOmdbPayloadToDb(cachedPayload, { imdbId, title, year, type });
+          return res.json(cachedPayload);
+        }
+      } catch (_) {
+        // fall through to raw cached response
+      }
+      if (sendCachedResponse(res, cached)) {
+        return;
+      }
     }
   }
 
@@ -1989,6 +2217,7 @@ app.get('/api/movie-ratings', async (req, res) => {
         type: payload.type || type || null
       }
     });
+    await writeOmdbPayloadToDb(payload, { imdbId, title, year, type });
 
     res.json(payload);
   } catch (err) {
